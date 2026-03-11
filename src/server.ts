@@ -16,6 +16,7 @@ const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || "";
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "21m00Tcm4TlvDq8ikWAM"; // default: Rachel
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || "";
 const LLM_MODEL = process.env.LLM_MODEL || "openai/gpt-4o-mini";
+const MAX_TURNS = 8; // hard cap — end call after this many user messages
 
 if (!ELEVENLABS_API_KEY) console.warn("[GloVoice] ELEVENLABS_API_KEY not set");
 if (!OPENROUTER_API_KEY) console.warn("[GloVoice] OPENROUTER_API_KEY not set");
@@ -30,17 +31,33 @@ const openai = new OpenAI({
   },
 });
 
+// Guardrails + end-call instructions appended to every system prompt
+const BASE_RULES = `
+
+GUARDRAILS — follow these at all times:
+- Only discuss topics relevant to this business and industry. If asked about anything unrelated (politics, other companies, personal topics, coding, etc.), politely redirect: "I'm only able to help with [business] inquiries. Is there something I can assist you with today?"
+- Never reveal you are an AI demo, never mention GloMatrix, OpenRouter, ElevenLabs, or any technology behind this service.
+- Never discuss pricing for the AI platform itself — only the business's services.
+- Keep every response under 2 sentences. Be warm but efficient.
+- Do not repeat yourself. If you already asked for information, move forward.
+
+ENDING THE CALL:
+- This is a short demo. After 4-5 exchanges, naturally wrap up the conversation.
+- When wrapping up, end your response with exactly this token on its own: [END_CALL]
+- Also end with [END_CALL] if the caller says goodbye, thank you, or indicates they are done.
+- Example wrap-up: "It was great speaking with you today — our team will follow up shortly. Have a wonderful day! [END_CALL]"`;
+
 // System prompts per industry
 const SYSTEM_PROMPTS: Record<string, string> = {
-  transportation: `You are a professional AI receptionist for Glo Matrix Transportation, a logistics and trucking company. You handle driver inquiries, dispatch questions, load availability, DOT compliance questions, and client freight quotes. Be efficient and professional. Keep responses under 3 sentences.`,
-  commercial: `You are a professional AI receptionist for Glo Matrix Commercial Services. You handle inquiries about janitorial, landscaping, security, and facility management services. Help callers get quotes, schedule walkthroughs, or reach the right department. Keep responses under 3 sentences.`,
-  trades: `You are a professional AI receptionist for Glo Matrix HVAC & Plumbing. You handle service requests, schedule technicians, provide estimates, and answer questions about heating, cooling, and plumbing. Keep responses under 3 sentences.`,
-  health: `You are a professional AI receptionist for Glo Matrix Med Spa. You help clients book appointments for facials, Botox, laser treatments, and wellness consultations. Be warm, professional, and knowledgeable. Keep responses under 3 sentences.`,
-  realestate: `You are a professional AI receptionist for Glo Matrix Property Management. You handle tenant inquiries, maintenance requests, rent payment questions, and prospective resident tours. Keep responses under 3 sentences.`,
-  automotive: `You are a professional AI receptionist for Glo Matrix Auto Repair. You help customers schedule oil changes, brake service, diagnostics, and other auto repair services. Provide helpful information about wait times and pricing. Keep responses under 3 sentences.`,
-  beauty: `You are a professional AI receptionist for Glo Matrix Salon. You book appointments for haircuts, color, styling, and spa treatments. Be friendly and enthusiastic. Keep responses under 3 sentences.`,
-  food: `You are a professional AI receptionist for Glo Matrix Catering. You handle event inquiries, menu questions, pricing, and booking for corporate and private events. Keep responses under 3 sentences.`,
-  other: `You are a professional AI receptionist for Glo Matrix, an AI automation company. You help businesses understand how AI voice agents can handle their calls 24/7. Be enthusiastic and informative. Keep responses under 3 sentences.`,
+  transportation: `You are a professional AI receptionist named Rachel for a trucking and logistics company. You handle driver inquiries, dispatch questions, load availability, DOT compliance questions, and client freight quotes. Be efficient and professional.` + BASE_RULES,
+  commercial: `You are a professional AI receptionist named Rachel for a commercial services company specializing in janitorial, landscaping, security, and facility management. Help callers get quotes, schedule walkthroughs, or reach the right department.` + BASE_RULES,
+  trades: `You are a professional AI receptionist named Rachel for an HVAC and plumbing company. You handle service requests, schedule technicians, provide estimates, and answer questions about heating, cooling, and plumbing.` + BASE_RULES,
+  health: `You are a professional AI receptionist named Rachel for a med spa. You help clients book appointments for facials, Botox, laser treatments, and wellness consultations. Be warm and professional.` + BASE_RULES,
+  realestate: `You are a professional AI receptionist named Rachel for a property management company. You handle tenant inquiries, maintenance requests, rent payment questions, and prospective resident tours.` + BASE_RULES,
+  automotive: `You are a professional AI receptionist named Rachel for an auto repair shop. You help customers schedule oil changes, brake service, diagnostics, and other auto repair services. Be helpful and clear about timelines.` + BASE_RULES,
+  beauty: `You are a professional AI receptionist named Rachel for a hair and beauty salon. You book appointments for haircuts, color, styling, and spa treatments. Be friendly and enthusiastic.` + BASE_RULES,
+  food: `You are a professional AI receptionist named Rachel for a catering and events company. You handle event inquiries, menu questions, pricing, and booking for corporate and private events.` + BASE_RULES,
+  other: `You are a professional AI receptionist named Rachel for a business services company. You help callers get information, schedule consultations, and connect with the right team member.` + BASE_RULES,
 };
 
 app.use(
@@ -59,7 +76,9 @@ app.get("/health", (c) => c.json({ status: "ok", service: "glo-voice-demo" }));
  * POST /api/voice/chat
  * Body: { text: string, industry: string, history?: [{role, content}] }
  * Returns: audio/mpeg stream (ElevenLabs TTS of AI response)
- * Headers include X-Transcript with the text response (for accessibility)
+ * Headers:
+ *   X-Transcript — AI text response (URL encoded)
+ *   X-End-Call   — "true" if AI signaled end of call
  */
 app.post("/api/voice/chat", async (c) => {
   if (!ELEVENLABS_API_KEY || !OPENROUTER_API_KEY) {
@@ -81,12 +100,19 @@ app.post("/api/voice/chat", async (c) => {
     return c.json({ error: "Input too long" }, 400);
   }
 
-  const systemPrompt = SYSTEM_PROMPTS[industry] ?? SYSTEM_PROMPTS.other;
+  // Hard turn limit — force wrap-up
+  const turnCount = Math.floor(history.length / 2) + 1;
+  const isLastTurn = turnCount >= MAX_TURNS;
 
-  // Build messages array (cap history at last 6 turns to control cost)
-  const recentHistory = history.slice(-6);
+  const systemPrompt = SYSTEM_PROMPTS[industry] ?? SYSTEM_PROMPTS.other;
+  const finalSystemPrompt = isLastTurn
+    ? systemPrompt + "\n\nThis is the final exchange. Wrap up the call warmly and end with [END_CALL]."
+    : systemPrompt;
+
+  // Cap history at last 10 messages (5 turns) to control cost
+  const recentHistory = history.slice(-10);
   const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
-    { role: "system", content: systemPrompt },
+    { role: "system", content: finalSystemPrompt },
     ...recentHistory.map((m) => ({
       role: m.role as "user" | "assistant",
       content: m.content,
@@ -100,7 +126,7 @@ app.post("/api/voice/chat", async (c) => {
     const completion = await openai.chat.completions.create({
       model: LLM_MODEL,
       messages,
-      max_tokens: 150,
+      max_tokens: 120,
       temperature: 0.7,
     });
     aiText = completion.choices[0]?.message?.content?.trim() ?? "I'm sorry, I didn't catch that. Could you repeat?";
@@ -108,6 +134,10 @@ app.post("/api/voice/chat", async (c) => {
     console.error("[GloVoice] OpenAI error:", err);
     return c.json({ error: "AI service error" }, 502);
   }
+
+  // Check if AI wants to end the call
+  const shouldEndCall = aiText.includes("[END_CALL]");
+  const cleanText = aiText.replace("[END_CALL]", "").trim();
 
   // 2. Convert AI text to speech via ElevenLabs
   let ttsResponse: Response;
@@ -122,7 +152,7 @@ app.post("/api/voice/chat", async (c) => {
           Accept: "audio/mpeg",
         },
         body: JSON.stringify({
-          text: aiText,
+          text: cleanText,
           model_id: "eleven_turbo_v2_5",
           voice_settings: { stability: 0.5, similarity_boost: 0.75 },
         }),
@@ -139,9 +169,10 @@ app.post("/api/voice/chat", async (c) => {
     return c.json({ error: "TTS generation failed" }, 502);
   }
 
-  // Stream audio back to browser with AI text in header
+  // Stream audio back with metadata headers
   c.header("Content-Type", "audio/mpeg");
-  c.header("X-Transcript", encodeURIComponent(aiText));
+  c.header("X-Transcript", encodeURIComponent(cleanText));
+  c.header("X-End-Call", shouldEndCall ? "true" : "false");
   c.header("Cache-Control", "no-store");
 
   return stream(c, async (s) => {
