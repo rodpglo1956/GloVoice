@@ -8,6 +8,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { stream } from "hono/streaming";
 import OpenAI from "openai";
+import { createClient } from "@supabase/supabase-js";
 
 const app = new Hono();
 
@@ -16,10 +17,17 @@ const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || "";
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "21m00Tcm4TlvDq8ikWAM"; // default: Rachel
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || "";
 const LLM_MODEL = process.env.LLM_MODEL || "openai/gpt-4o-mini";
-const MAX_TURNS = 8; // hard cap — end call after this many user messages
+const MAX_TURNS = 8;
+const SUPABASE_URL = process.env.SUPABASE_URL || "";
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 
 if (!ELEVENLABS_API_KEY) console.warn("[GloVoice] ELEVENLABS_API_KEY not set");
 if (!OPENROUTER_API_KEY) console.warn("[GloVoice] OPENROUTER_API_KEY not set");
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) console.warn("[GloVoice] Supabase not configured — leads will not be saved");
+
+const supabase = SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
+  ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+  : null;
 
 // OpenAI SDK works with OpenRouter — just swap the base URL
 const openai = new OpenAI({
@@ -41,7 +49,8 @@ LEAD COLLECTION — only when the caller genuinely wants to book, schedule, or b
 - Do not ask for all three at once. Ask for name first, then phone, then email.
 - Once you have all three, confirm: "Perfect, I've got your information and someone from our team will reach out to you shortly at the email and number you provided."
 - Do NOT collect info from callers who are just asking general questions or browsing — only real booking intent.
-- After confirming their info, end the call with [END_CALL].
+- After confirming their info, append this exact token (hidden, not spoken): [LEAD:{"name":"FULL_NAME","phone":"PHONE","email":"EMAIL"}]
+- Then end the call with [END_CALL].
 
 GUARDRAILS — follow these at all times:
 - Only discuss topics relevant to this business and industry. If asked about anything unrelated (politics, other companies, personal topics, coding, etc.), politely redirect: "I'm only able to help with inquiries for this business. Is there something I can assist you with today?"
@@ -147,7 +156,30 @@ app.post("/api/voice/chat", async (c) => {
 
   // Check if AI wants to end the call
   const shouldEndCall = aiText.includes("[END_CALL]");
-  const cleanText = aiText.replace("[END_CALL]", "").trim();
+
+  // Extract and save lead if present
+  const leadMatch = aiText.match(/\[LEAD:(\{[^}]+\})\]/);
+  if (leadMatch && supabase) {
+    try {
+      const lead = JSON.parse(leadMatch[1]);
+      await supabase.from("voice_leads").insert({
+        name: lead.name ?? "",
+        phone: lead.phone ?? null,
+        email: lead.email ?? null,
+        industry,
+        source: "voice_demo",
+      });
+      console.log(`[GloVoice] Lead saved: ${lead.name} / ${lead.email}`);
+    } catch (err) {
+      console.error("[GloVoice] Failed to save lead:", err);
+    }
+  }
+
+  // Strip all tokens before sending to TTS
+  const cleanText = aiText
+    .replace("[END_CALL]", "")
+    .replace(/\[LEAD:\{[^}]+\}\]/, "")
+    .trim();
 
   // 2. Convert AI text to speech via ElevenLabs
   let ttsResponse: Response;

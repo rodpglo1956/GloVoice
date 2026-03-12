@@ -7,6 +7,7 @@
     "dev": "bun --watch run src/server.ts"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.49.4",
     "hono": "^4.7.7",
     "openai": "^4.77.0"
   }
