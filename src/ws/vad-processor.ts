@@ -5,6 +5,10 @@
  *
  * For barge-in, we only need to detect "is the user talking while Marie
  * is speaking?" — energy-based detection is sufficient for this.
+ *
+ * Tuned to reject speaker echo: browser echo cancellation helps but
+ * isn't perfect on laptops. High RMS threshold + many consecutive frames
+ * ensures only deliberate speech triggers barge-in.
  */
 
 // ---------------------------------------------------------------------------
@@ -19,14 +23,16 @@ export interface VADProcessor {
   processFrame(pcmBuffer: ArrayBuffer): boolean;
   /** Reset VAD state (e.g., after a barge-in is handled). */
   reset(): void;
+  /** Start a cooldown period where VAD ignores all input (e.g., when Marie starts speaking). */
+  startCooldown(ms: number): void;
 }
 
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
 
-const RMS_THRESHOLD = 800; // Int16 RMS threshold for "speech" (tune as needed)
-const SPEECH_FRAMES_REQUIRED = 3; // Consecutive frames above threshold to trigger
+const RMS_THRESHOLD = 2000; // Int16 RMS — raised from 800 to reject speaker echo
+const SPEECH_FRAMES_REQUIRED = 6; // Consecutive frames above threshold — raised from 3
 const SILENCE_FRAMES_REQUIRED = 5; // Consecutive frames below threshold to clear
 
 // ---------------------------------------------------------------------------
@@ -41,9 +47,15 @@ export function createVADProcessor(): VADProcessor {
   let speechFrameCount = 0;
   let silenceFrameCount = 0;
   let isSpeaking = false;
+  let cooldownUntil = 0;
 
   return {
     processFrame(pcmBuffer: ArrayBuffer): boolean {
+      // During cooldown, ignore all audio (prevents echo from triggering barge-in)
+      if (Date.now() < cooldownUntil) {
+        return false;
+      }
+
       const int16 = new Int16Array(pcmBuffer);
 
       // Calculate RMS energy
@@ -73,6 +85,13 @@ export function createVADProcessor(): VADProcessor {
     },
 
     reset(): void {
+      speechFrameCount = 0;
+      silenceFrameCount = 0;
+      isSpeaking = false;
+    },
+
+    startCooldown(ms: number): void {
+      cooldownUntil = Date.now() + ms;
       speechFrameCount = 0;
       silenceFrameCount = 0;
       isSpeaking = false;

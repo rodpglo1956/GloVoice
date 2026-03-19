@@ -207,9 +207,13 @@ export class VoiceSession {
 
   /**
    * Transition to speaking state (called when TTS starts playing).
+   * Starts a VAD cooldown to prevent Marie's own audio from triggering barge-in.
    */
   setSpeaking(): void {
     this.setState("speaking");
+    // 800ms cooldown — ignore VAD while echo cancellation settles
+    this.vadProcessor?.startCooldown(800);
+    this.consecutiveSpeechFrames = 0;
   }
 
   /**
