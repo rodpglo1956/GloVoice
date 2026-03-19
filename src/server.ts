@@ -27,11 +27,16 @@ const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || "";
 const LLM_MODEL = process.env.LLM_MODEL || "openai/gpt-4o-mini";
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
+const RESEND_API_KEY = process.env.RESEND_API_KEY || "";
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
 
 if (!ELEVENLABS_API_KEY) console.warn("[GloVoice] ELEVENLABS_API_KEY not set");
 if (!OPENROUTER_API_KEY) console.warn("[GloVoice] OPENROUTER_API_KEY not set");
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY)
   console.warn("[GloVoice] Supabase not configured — leads will not be saved");
+if (!RESEND_API_KEY) console.warn("[GloVoice] RESEND_API_KEY not set — lead emails disabled");
+if (!TELEGRAM_BOT_TOKEN) console.warn("[GloVoice] TELEGRAM_BOT_TOKEN not set — lead alerts disabled");
 
 const supabase =
   SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
@@ -607,6 +612,94 @@ function isCompleteLead(lead: LeadState): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Lead confirmation email via Resend
+// ---------------------------------------------------------------------------
+
+async function sendLeadConfirmationEmail(lead: LeadState, industry: string) {
+  if (!RESEND_API_KEY) return;
+
+  const businessName = INDUSTRY_NAMES[industry] ?? INDUSTRY_NAMES.other;
+  const firstName = lead.name.split(" ")[0] || lead.name;
+
+  try {
+    const res = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${RESEND_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        from: "Glo Matrix <info@glomatrix.app>",
+        to: [lead.email],
+        subject: `Thanks for reaching out to ${businessName}`,
+        html: `
+          <div style="font-family: 'Inter', Arial, sans-serif; max-width: 520px; margin: 0 auto; padding: 40px 24px; background: #0d0d1a; color: #ffffff;">
+            <div style="background: linear-gradient(135deg, #ec008c, #7b2ff7); padding: 2px; border-radius: 16px; margin-bottom: 32px;">
+              <div style="background: #0d0d1a; border-radius: 14px; padding: 32px 24px;">
+                <h1 style="margin: 0 0 16px; font-size: 22px; font-weight: 700;">Hi ${firstName},</h1>
+                <p style="margin: 0 0 16px; color: rgba(255,255,255,0.75); font-size: 15px; line-height: 1.6;">
+                  Thanks for speaking with us at ${businessName}. We've received your information and a member of our team will be reaching out to you soon.
+                </p>
+                <p style="margin: 0 0 16px; color: rgba(255,255,255,0.75); font-size: 15px; line-height: 1.6;">
+                  In the meantime, if you have any questions, feel free to reply to this email or reach us at <a href="mailto:info@glomatrix.app" style="color: #ec008c;">info@glomatrix.app</a>.
+                </p>
+                <p style="margin: 0; color: rgba(255,255,255,0.5); font-size: 14px;">
+                  — The ${businessName} Team
+                </p>
+              </div>
+            </div>
+            <p style="text-align: center; color: rgba(255,255,255,0.25); font-size: 12px; margin: 0;">
+              Powered by Glo Matrix
+            </p>
+          </div>
+        `,
+      }),
+    });
+
+    if (res.ok) {
+      console.log(`[GloVoice] Confirmation email sent to ${lead.email}`);
+    } else {
+      const err = await res.text();
+      console.error(`[GloVoice] Resend error ${res.status}:`, err);
+    }
+  } catch (err) {
+    console.error("[GloVoice] Email send failed:", err);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Telegram lead alert to Rod
+// ---------------------------------------------------------------------------
+
+async function sendTelegramLeadAlert(lead: LeadState, industry: string) {
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
+
+  const businessName = INDUSTRY_NAMES[industry] ?? INDUSTRY_NAMES.other;
+  const text = `🔔 New Voice Lead
+
+📋 ${lead.name}
+📞 ${lead.phone}
+📧 ${lead.email}
+🏢 ${businessName}
+📍 Source: Voice Demo`;
+
+  try {
+    await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: TELEGRAM_CHAT_ID,
+        text,
+        parse_mode: "HTML",
+      }),
+    });
+    console.log(`[GloVoice] Telegram alert sent for ${lead.name}`);
+  } catch (err) {
+    console.error("[GloVoice] Telegram alert failed:", err);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // CORS
 // ---------------------------------------------------------------------------
 
@@ -798,19 +891,26 @@ app.post("/api/voice/chat", async (c) => {
   const response = parseAssistantResponse(aiRaw);
 
   // 2. Save lead if flagged and complete
-  if (response.save_lead && isCompleteLead(response.lead) && supabase) {
-    try {
-      await supabase.from("voice_leads").insert({
-        name: response.lead.name,
-        phone: response.lead.phone,
-        email: response.lead.email,
-        industry,
-        source: "voice_demo",
-      });
-      console.log(`[GloVoice] Lead saved: ${response.lead.name} / ${response.lead.email}`);
-    } catch (err) {
-      console.error("[GloVoice] Failed to save lead:", err);
+  if (response.save_lead && isCompleteLead(response.lead)) {
+    // Save to Supabase
+    if (supabase) {
+      try {
+        await supabase.from("voice_leads").insert({
+          name: response.lead.name,
+          phone: response.lead.phone,
+          email: response.lead.email,
+          industry,
+          source: "voice_demo",
+        });
+        console.log(`[GloVoice] Lead saved: ${response.lead.name} / ${response.lead.email}`);
+      } catch (err) {
+        console.error("[GloVoice] Failed to save lead:", err);
+      }
     }
+
+    // Send confirmation email + Telegram alert (fire-and-forget, don't block TTS)
+    sendLeadConfirmationEmail(response.lead, industry);
+    sendTelegramLeadAlert(response.lead, industry);
   }
 
   // 3. Convert spoken text to speech
