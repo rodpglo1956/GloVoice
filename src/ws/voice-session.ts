@@ -64,6 +64,8 @@ export class VoiceSession {
   private firstAudioSentTime = 0;
   /** Whether this is the greeting turn (no user input yet) */
   private isGreeting = false;
+  /** Guard: true while handleFinalTranscript is running (prevents concurrent calls) */
+  private pipelineRunning = false;
 
   constructor(
     browserWs: { send(data: string | ArrayBuffer): number },
@@ -122,8 +124,10 @@ export class VoiceSession {
         }
       }
     }
-    // During 'processing' state: audio is intentionally dropped
-    // to prevent TTS playback from being transcribed back (echo hallucination).
+    // During 'processing' state: still feed Deepgram so it stays ready
+    else if (this.state === "processing" && this.deepgram) {
+      this.deepgram.send(data);
+    }
   }
 
   /**
@@ -144,6 +148,7 @@ export class VoiceSession {
 
     this.vadProcessor?.reset();
     this.consecutiveSpeechFrames = 0;
+    this.pipelineRunning = false;
     this.setState("idle");
     this.conversationHistory = [];
     this.lead = { name: "", phone: "", email: "" };
@@ -202,7 +207,6 @@ export class VoiceSession {
 
   /**
    * Transition to speaking state (called when TTS starts playing).
-   * Mutes Deepgram forwarding and starts keepalive.
    */
   setSpeaking(): void {
     this.setState("speaking");
@@ -212,16 +216,24 @@ export class VoiceSession {
    * Transition back to listening after speaking completes.
    */
   resumeListening(): void {
-    if (this.state === "speaking" || this.state === "processing") {
+    if (this.state === "speaking" || this.state === "processing" || this.state === "interrupted") {
       this.setState("listening");
     }
   }
 
   /**
    * Add an entry to conversation history.
+   * For assistant entries, wrap in JSON so the LLM sees consistent format.
    */
   addToHistory(role: "user" | "assistant", content: string): void {
-    this.conversationHistory.push({ role, content });
+    if (role === "assistant") {
+      // Store as JSON so the LLM sees the same format it's expected to output.
+      // Prevents the model from drifting to plain text after seeing non-JSON history.
+      const jsonContent = JSON.stringify({ spoken: content, save_lead: false, end_call: false });
+      this.conversationHistory.push({ role, content: jsonContent });
+    } else {
+      this.conversationHistory.push({ role, content });
+    }
     // Cap history at 20 entries (10 turns)
     if (this.conversationHistory.length > 20) {
       this.conversationHistory = this.conversationHistory.slice(-20);
@@ -241,6 +253,9 @@ export class VoiceSession {
       this.deepgram = null;
     }
 
+    // Track whether we've already triggered for the current utterance
+    let lastHandledTranscript = "";
+
     this.deepgram = createDeepgramConnection(
       // onTranscript
       (text: string, isFinal: boolean) => {
@@ -258,6 +273,14 @@ export class VoiceSession {
         });
 
         if (isFinal && text.trim()) {
+          // Guard: skip if we already handled this exact transcript
+          // (Deepgram can fire both is_final and speech_final for the same text)
+          if (text.trim() === lastHandledTranscript) {
+            console.log("[VoiceSession] Skipping duplicate final transcript");
+            return;
+          }
+          lastHandledTranscript = text.trim();
+
           this.addToHistory("user", text.trim());
           // Trigger the LLM → TTS streaming pipeline
           this.handleFinalTranscript(text.trim());
@@ -364,6 +387,13 @@ export class VoiceSession {
    * Triggers the streaming pipeline: LLM → TokenBuffer → ElevenLabs → browser.
    */
   private async handleFinalTranscript(userText: string): Promise<void> {
+    // Guard: prevent concurrent pipeline runs (double transcripts, barge-in re-entry)
+    if (this.pipelineRunning) {
+      console.log("[VoiceSession] Pipeline already running, skipping transcript:", userText);
+      return;
+    }
+    this.pipelineRunning = true;
+
     // Transition to processing
     this.setState("processing");
 
@@ -427,11 +457,14 @@ export class VoiceSession {
 
       // Handle end call
       if (result.end_call) {
+        this.pipelineRunning = false;
         this.sendToBrowser({ type: "end_call" });
         return; // Don't resume listening
       }
 
       // Resume listening for next user utterance
+      this.activeElevenLabsClose = null;
+      this.pipelineRunning = false;
       this.resumeListening();
     } catch (err) {
       console.error("[VoiceSession] Pipeline error:", err);
@@ -439,6 +472,8 @@ export class VoiceSession {
         type: "error",
         message: "Processing error",
       });
+      this.activeElevenLabsClose = null;
+      this.pipelineRunning = false;
       this.resumeListening();
     }
   }

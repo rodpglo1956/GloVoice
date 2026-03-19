@@ -55,7 +55,7 @@ export class TokenBuffer {
     // Match: sentence-ending punctuation followed by a space (meaning next sentence starts).
     // We split on the boundary AFTER the punctuation and BEFORE the space.
     // Also handle punctuation at end-of-string (the whole buffer is one complete sentence).
-    const boundaryRegex = /[.!?:](?=\s|$)/g;
+    const boundaryRegex = /[.!?](?=\s|$)/g;
 
     let lastFlushEnd = 0;
     let match: RegExpExecArray | null;

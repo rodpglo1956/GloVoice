@@ -10,7 +10,7 @@
  */
 
 export interface ElevenLabsWSClient {
-  /** Send a text chunk. If flush=true, ElevenLabs generates audio immediately. */
+  /** Send a text chunk. If flush=true, ElevenLabs generates audio immediately. Queues if WS not open yet. */
   sendText(text: string, flush?: boolean): void;
   /** Send end-of-stream signal (EOS). */
   endStream(): void;
@@ -41,13 +41,24 @@ export function createElevenLabsWS(
 
   let ws: WebSocket | null = null;
   let open = false;
+  let closed = false;
   let eosQueued = false;
+  let doneFired = false;
+  // Queue messages that arrive before the WS is open
+  const pendingQueue: string[] = [];
+
+  function fireDone() {
+    if (!doneFired) {
+      doneFired = true;
+      onDone();
+    }
+  }
 
   try {
     ws = new WebSocket(url);
   } catch (err) {
     console.error("[ElevenLabs] Failed to create WebSocket:", err);
-    setTimeout(onDone, 0);
+    setTimeout(fireDone, 0);
     return { sendText() {}, endStream() {}, close() {} };
   }
 
@@ -68,6 +79,12 @@ export function createElevenLabsWS(
     };
     ws!.send(JSON.stringify(bos));
     console.log("[ElevenLabs] WebSocket opened, BOS sent");
+
+    // Flush any messages that were queued while connecting
+    for (const msg of pendingQueue) {
+      ws!.send(msg);
+    }
+    pendingQueue.length = 0;
   });
 
   ws.addEventListener("message", (event: MessageEvent) => {
@@ -77,7 +94,7 @@ export function createElevenLabsWS(
         onAudio(data.audio);
       }
       if (data.isFinal) {
-        onDone();
+        fireDone();
       }
     } catch (err) {
       console.error("[ElevenLabs] Failed to parse message:", err);
@@ -87,32 +104,45 @@ export function createElevenLabsWS(
   ws.addEventListener("error", (event: Event) => {
     console.error("[ElevenLabs] WebSocket error:", event);
     open = false;
-    onDone();
+    fireDone();
   });
 
   ws.addEventListener("close", () => {
     open = false;
     console.log("[ElevenLabs] WebSocket closed");
+    // Resolve the done promise on close — critical for barge-in
+    // so the pipeline doesn't hang for 15 seconds
+    fireDone();
   });
 
   return {
     sendText(text: string, flush = false) {
+      if (closed) return;
+      const msg = JSON.stringify({ text, flush });
       if (ws && open) {
-        ws.send(JSON.stringify({ text, flush }));
+        ws.send(msg);
+      } else if (ws) {
+        // WS connecting but not open yet — queue for delivery
+        pendingQueue.push(msg);
       }
     },
 
     endStream() {
-      if (ws && open && !eosQueued) {
-        eosQueued = true;
-        // EOS: empty text signals end of input
-        ws.send(JSON.stringify({ text: "" }));
+      if (closed || eosQueued) return;
+      eosQueued = true;
+      const msg = JSON.stringify({ text: "" });
+      if (ws && open) {
+        ws.send(msg);
         console.log("[ElevenLabs] EOS sent");
+      } else if (ws) {
+        pendingQueue.push(msg);
       }
     },
 
     close() {
+      closed = true;
       open = false;
+      pendingQueue.length = 0;
       if (ws) {
         try {
           ws.close();
