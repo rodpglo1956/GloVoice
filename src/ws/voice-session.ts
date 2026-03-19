@@ -10,6 +10,7 @@ import {
   type LeadState,
   type StreamLLMToTTSResult,
 } from "../pipeline/audio-pipeline";
+import { createVADProcessor, type VADProcessor } from "./vad-processor";
 import type OpenAI from "openai";
 
 // ---------------------------------------------------------------------------
@@ -52,6 +53,13 @@ export class VoiceSession {
   private keepAliveInterval: ReturnType<typeof setInterval> | null = null;
   private lead: LeadState = { name: "", phone: "", email: "" };
   private config: VoiceSessionConfig;
+  private vadProcessor: VADProcessor | null = null;
+  private consecutiveSpeechFrames = 0;
+  private static readonly BARGE_IN_THRESHOLD = 3; // Require 3 consecutive speech frames
+  /** Active ElevenLabs WS handle — stored so barge-in can close it */
+  private activeElevenLabsClose: (() => void) | null = null;
+  /** Timestamp of last speech_final / utterance_end from Deepgram */
+  private speechEndTime = 0;
 
   constructor(
     browserWs: { send(data: string | ArrayBuffer): number },
@@ -59,6 +67,15 @@ export class VoiceSession {
   ) {
     this.browserWs = browserWs;
     this.config = config;
+    // Initialize VAD asynchronously
+    createVADProcessor().then((vad) => {
+      this.vadProcessor = vad;
+      if (vad) {
+        console.log("[VoiceSession] VAD processor initialized (avr-vad)");
+      } else {
+        console.warn("[VoiceSession] VAD unavailable — barge-in via Deepgram VAD events only");
+      }
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -83,14 +100,33 @@ export class VoiceSession {
 
   /**
    * Handle binary audio frames from the browser.
-   * Only forwards to Deepgram when in 'listening' state.
-   * Mutes during 'speaking' and 'processing' states to prevent echo.
+   * During 'listening': forward to Deepgram for STT.
+   * During 'speaking': route to VAD for barge-in detection AND keep Deepgram fed.
    */
   onAudioFrame(data: ArrayBuffer): void {
     if (this.state === "listening" && this.deepgram) {
       this.deepgram.send(data);
+    } else if (this.state === "speaking") {
+      // Keep Deepgram fed so it's ready when barge-in triggers
+      if (this.deepgram) {
+        this.deepgram.send(data);
+      }
+      // Run VAD for barge-in detection
+      if (this.vadProcessor) {
+        this.vadProcessor.processFrame(data).then((isSpeech) => {
+          if (this.state !== "speaking") return; // state changed while awaiting
+          if (isSpeech) {
+            this.consecutiveSpeechFrames++;
+            if (this.consecutiveSpeechFrames >= VoiceSession.BARGE_IN_THRESHOLD) {
+              this.handleBargeIn();
+            }
+          } else {
+            this.consecutiveSpeechFrames = 0;
+          }
+        });
+      }
     }
-    // During 'speaking'/'processing' state: audio is intentionally dropped
+    // During 'processing' state: audio is intentionally dropped
     // to prevent TTS playback from being transcribed back (echo hallucination).
   }
 
@@ -105,10 +141,46 @@ export class VoiceSession {
       this.deepgram = null;
     }
 
+    if (this.activeElevenLabsClose) {
+      this.activeElevenLabsClose();
+      this.activeElevenLabsClose = null;
+    }
+
+    this.vadProcessor?.reset();
+    this.consecutiveSpeechFrames = 0;
     this.setState("idle");
     this.conversationHistory = [];
     this.lead = { name: "", phone: "", email: "" };
     console.log("[VoiceSession] Cleaned up");
+  }
+
+  /**
+   * Handle barge-in: user spoke while agent was speaking.
+   * Stops TTS, clears browser playback, transitions to listening.
+   */
+  private handleBargeIn(): void {
+    if (this.state !== "speaking") return;
+
+    console.log("[VoiceSession] Barge-in detected — interrupting agent");
+
+    // 1. Set state to interrupted (then quickly to listening)
+    this.setState("interrupted");
+
+    // 2. Close active ElevenLabs connection to stop TTS generation
+    if (this.activeElevenLabsClose) {
+      this.activeElevenLabsClose();
+      this.activeElevenLabsClose = null;
+    }
+
+    // 3. Tell browser to clear its playback queue
+    this.sendToBrowser({ type: "stop_playback" });
+
+    // 4. Reset VAD state
+    this.vadProcessor?.reset();
+    this.consecutiveSpeechFrames = 0;
+
+    // 5. Transition to listening — Deepgram is already receiving audio
+    this.setState("listening");
   }
 
   /**
@@ -234,6 +306,11 @@ export class VoiceSession {
         llmModel: this.config.llmModel,
         voiceId: this.config.elevenLabsVoiceId,
         elevenLabsApiKey: this.config.elevenLabsApiKey,
+
+        // onTTSReady: store close handle for barge-in
+        onTTSReady: (closeFn: () => void) => {
+          this.activeElevenLabsClose = closeFn;
+        },
 
         // onAudio: send binary PCM to browser, set speaking state on first chunk
         onAudio: (pcmBuffer: ArrayBuffer) => {

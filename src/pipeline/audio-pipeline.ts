@@ -34,6 +34,8 @@ export interface StreamLLMToTTSParams {
   onSpoken: (fullText: string) => void;
   /** Called when all audio generation is complete */
   onDone: () => void;
+  /** Called with the ElevenLabs close function so caller can abort TTS on barge-in */
+  onTTSReady?: (closeFn: () => void) => void;
 }
 
 export interface StreamLLMToTTSResult {
@@ -145,6 +147,7 @@ export async function streamLLMToTTS(
     onAudio,
     onSpoken,
     onDone,
+    onTTSReady,
   } = params;
 
   // Track the full accumulated LLM response for parsing after stream ends
@@ -173,6 +176,9 @@ export async function streamLLMToTTS(
       resolveElDone();
     }
   );
+
+  // Expose close handle for barge-in abort
+  onTTSReady?.(() => elevenlabs.close());
 
   // --- Token Buffer ---
   const tokenBuffer = new TokenBuffer((chunk: string) => {

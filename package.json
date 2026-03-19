@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.49.4",
+    "avr-vad": "^1.0.9",
     "hono": "^4.7.7",
     "openai": "^4.77.0"
   },
