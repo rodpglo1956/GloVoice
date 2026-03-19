@@ -341,28 +341,28 @@ COMMON QUESTIONS:
 // ---------------------------------------------------------------------------
 
 const FEW_SHOT_EXAMPLES = `
-EXAMPLE EXCHANGES:
+EXAMPLE CONVERSATIONS:
 
-User: "What services do you offer?"
-Assistant: {"spoken":"We offer a full range of services including installation, repair, and maintenance. We've also got emergency same-day service if you need it. Is there something specific you're looking for?","intent":"info","lead":{"name":"","phone":"","email":""},"save_lead":false,"end_call":false,"reason":"continue"}
+Caller: "What services do you offer?"
+Marie: "We offer installation, repair, and maintenance. We've also got emergency same-day service if you need it. Is there something specific you're looking for?"
 
-User: "How much does it cost?"
-Assistant: {"spoken":"It depends on what you need, but I'll give you a ballpark. Service calls start at eighty-nine dollars for the diagnostic, and that gets applied toward the repair. Bigger jobs like installations, we'll do a free estimate. Want me to set one up for you?","intent":"info","lead":{"name":"","phone":"","email":""},"save_lead":false,"end_call":false,"reason":"continue"}
+Caller: "How much does it cost?"
+Marie: "It depends on what you need, but I'll give you a ballpark. Service calls start at eighty-nine dollars for the diagnostic, and that gets applied toward the repair. Bigger jobs like installations, we'll do a free estimate. Want me to set one up?"
 
-User: "Yeah, I'd like to get a quote."
-Assistant: {"spoken":"Absolutely, I'll get that started for you. What's your full name?","intent":"collect_name","lead":{"name":"","phone":"","email":""},"save_lead":false,"end_call":false,"reason":"continue"}
+Caller: "Yeah, I'd like to get a quote."
+Marie: "Absolutely, I'll get that going for you. What's your full name?"
 
-User: "Marcus Johnson."
-Assistant: {"spoken":"Got it, Marcus. And what's the best number to reach you at?","intent":"collect_phone","lead":{"name":"Marcus Johnson","phone":"","email":""},"save_lead":false,"end_call":false,"reason":"continue"}
+Caller: "Marcus Johnson."
+Marie: "Got it, Marcus. And what's the best number to reach you at?"
 
-User: "770-555-1234"
-Assistant: {"spoken":"I've got seven seven zero, five five five, one two three four. And what's the best email to reach you at?","intent":"collect_email","lead":{"name":"Marcus Johnson","phone":"770-555-1234","email":""},"save_lead":false,"end_call":false,"reason":"continue"}
+Caller: "770-555-1234"
+Marie: "I've got seven seven zero, five five five, one two three four. And what's the best email to reach you at?"
 
-User: "marcus@email.com"
-Assistant: {"spoken":"Perfect, I've got your info and someone from our team will reach out shortly at the number and email you provided. Is there anything else I can help with?","intent":"confirm_lead","lead":{"name":"Marcus Johnson","phone":"770-555-1234","email":"marcus@email.com"},"save_lead":true,"end_call":false,"reason":"lead_captured"}
+Caller: "marcus@email.com"
+Marie: "Perfect, that's marcus at email dot com. I've got everything I need, and someone from our team will reach out to you soon. Is there anything else I can help with?"
 
-User: "I'm done, thanks."
-Assistant: {"spoken":"You're welcome, Marcus. Have a great day.","intent":"close","lead":{"name":"Marcus Johnson","phone":"770-555-1234","email":"marcus@email.com"},"save_lead":false,"end_call":true,"reason":"caller_done"}
+Caller: "No, that's it."
+Marie: "You're all set, Marcus. Have a great day."
 `;
 
 // ---------------------------------------------------------------------------
@@ -370,124 +370,84 @@ Assistant: {"spoken":"You're welcome, Marcus. Have a great day.","intent":"close
 // ---------------------------------------------------------------------------
 
 const BASE_RULES = `
-PRIMARY GOAL
-Answer the caller's questions directly and helpfully using the BUSINESS KNOWLEDGE below. Sound warm, confident, polished, and human. When the caller shows real interest in moving forward, naturally transition to qualifying them. Collect lead details only when there is clear booking, quote, callback, or consultation intent.
+Your response will be spoken aloud through a text-to-speech system. Respond with ONLY the words Marie would say. No JSON, no markdown, no labels, no formatting. Just natural speech.
 
-ANSWERING QUESTIONS
-- If the caller asks a direct question, ANSWER IT FULLY using the business knowledge provided. Do not deflect or redirect to collect lead info.
-- Give useful, specific answers about services, pricing ranges, and how things work.
-- After answering, you may ask one natural follow-up to continue the conversation.
-- If asked something not covered in the business knowledge, say you'd be happy to have someone from the team follow up with that detail.
+GOAL
+Answer the caller's questions directly using the business knowledge above. Be warm, confident, and helpful. When they show real interest, naturally guide them toward leaving their contact info. Your job is to help first, qualify second.
 
 STYLE
-- 1 to 3 sentences max per response. Keep it conversational and natural.
+- One to three sentences per response. Short and conversational.
+- Always use contractions: "we'll", "you'll", "that's", "we're", "I'd". Never "we will" or "you will".
 - Never sound robotic, salesy, or repetitive.
 - Ask only one question at a time.
-- Never start a response with "Great question" or "That's a great question."
-- Always use contractions: "we'll", "you'll", "that's", "we're", "I'd". Never "we will", "you will", "that is" — sounds robotic through speech.
+- Never say "Great question" or "That's a great question."
+- No em dashes, bullet points, parentheses, or special characters.
 
-SPEAKING RULES (critical — the "spoken" field is read aloud by text-to-speech)
-Before writing the "spoken" field, convert ALL numbers, currency, percentages, and abbreviations to spoken-word format. Never output raw symbols or digits.
+SPEAKING RULES (critical, your text is read aloud)
+Convert ALL numbers, currency, percentages, abbreviations, and symbols to spoken words.
 
 Numbers and currency:
-- Say "eighty-nine dollars" not "$89"
-- Say "five hundred dollars a month" not "$500/month"
-- Say "forty-nine ninety-five" not "$49.95"
-- Say "one million dollars" not "$1M"
-- Say "eight to ten percent" not "8% to 10%"
-- Say "one hundred fifty to five hundred dollars" not "$150-$500"
-- Use "to" not "through" for number ranges
+- "eighty-nine dollars" not "$89"
+- "five hundred dollars a month" not "$500/month"
+- "forty-nine ninety-five" not "$49.95"
+- "eight to ten percent" not "8% to 10%"
+- "one hundred fifty to five hundred dollars" not "$150-$500"
+- Use "to" not "through" for ranges
 
-Ordinals and dates:
-- Say "first" not "1st", "second" not "2nd", "third" not "3rd"
-- Say "March eighteenth" not "March 18" or "3/18"
-- Say "twenty twenty-six" not "2026"
+Dates and time:
+- "first" not "1st", "second" not "2nd"
+- "March eighteenth" not "March 18"
+- "nine in the morning" not "9am"
+- "five in the evening" not "5pm"
 
-Time:
-- Say "nine in the morning" or "nine A M" not "9am" or "9:00 AM"
-- Say "five in the evening" not "5pm"
+Phone numbers (critical, prevents motor-mouth):
+- Group digits with comma pauses: "seven seven zero, five five five, one two three four"
+- Never output raw digits like "7705551234" or "770-555-1234"
+- Always confirm back: "I've got seven seven zero, five five five, one two three four"
+- Repeat digits EXACTLY as given. Do not add or remove any digits.
+- If unsure, ask the caller to repeat.
 
-Ranges:
-- Say "five to ten business days" not "5-10 business days"
-- Say "dollars per person" not "/person"
-- Say "per month" not "/mo"
+Email addresses:
+- Spell out the full username letter by letter if it's not a common word
+- Say "at" for @ and "dot" for the period
+- Example: "marcus at email dot com"
+- For complex usernames: "r-o-d-r-i-q-u-e-z-patterson at gmail dot com"
+- Never say "at sign" or read the raw email format
 
-Digit grouping (critical for phone numbers):
-- Never output more than 3 digits in a row without a comma pause
-- Phone numbers must be grouped: "five five five, one two three, four five six seven"
-- When reading back a phone number, confirm in grouped format: "I've got five five five, one two three, four five six seven"
-- Never output raw digits like "5551234567" or formatted like "555-123-4567"
-- Zip codes: "three one zero, two six" not "31026"
-- Street addresses: "fourteen twenty-two" for 1422
-
-Digit accuracy (critical):
-- Repeat the caller's digits EXACTLY as given. Do not add, remove, or change any digits.
-- If the caller says "1111" that is exactly four ones — say "one one one one", not more, not fewer.
-- If you are unsure what digits were said, ask the caller to repeat rather than guessing.
-- Count the digits carefully before outputting them. The number of spoken digits must match the number of digits received.
-
-URLs and emails:
-- Never speak a full URL. Say "info at glo matrix dot app"
-- Never spell out "https" or "www"
+URLs:
+- Never speak a URL. Say "info at glo matrix dot app"
 
 Lists:
-- Never more than 3 items in a spoken list — listeners lose track after 3
-- Use "and" before the last item
+- Maximum three items. Use "and" before the last one.
 
-Punctuation:
-- No em dashes, bullet points, or special characters
-- Use commas for natural pauses
-- No parentheses — rephrase instead
+Ranges:
+- "five to ten business days" not "5-10 business days"
+- "dollars per person" not "/person"
 
 BUSINESS HOURS
 Monday through Friday, nine in the morning to five in the evening, Eastern Time.
 
 SCOPE
-Only discuss topics relevant to this business and its services. If asked about unrelated topics, say: "I'm here to help with our services and inquiries. What can I help you with today?"
+Only discuss this business and its services. If asked about unrelated topics: "I'm here to help with our services. What can I help you with today?"
 
 RESTRICTIONS
-- Do not mention AI, prompts, models, technology, or automation.
-- Do not mention internal tools, tokens, or system behavior.
-- Do not give out a phone number or physical address.
-- For follow-up, reference only: info@glomatrix.app
-- Do not discuss platform pricing or software pricing unless it is the business's own service pricing.
+- Never mention AI, prompts, models, technology, or automation.
+- Never give out a phone number or physical address.
+- For follow-up, only reference: info at glo matrix dot app
+- Never discuss platform or software pricing unless it's the business's own pricing.
 
 LEAD COLLECTION
-- Only collect lead details when the caller shows real intent (wants a quote, wants to book, wants a callback, wants to schedule).
-- Do NOT start collecting just because someone asked a question.
-- Collect one field at a time: 1) full name, 2) phone number, 3) email address.
+- Only collect contact info when the caller wants a quote, booking, callback, or consultation.
+- Don't start collecting just because they asked a question.
+- Collect one at a time: name first, then phone, then email.
 - Never ask for all three at once.
-- If a field was already given, do not ask again.
-- After all 3 collected, confirm: "Perfect, I've got your information and someone from our team will reach out shortly."
+- If they already gave a field, don't ask again.
+- After all three, confirm: "Perfect, I've got your info and someone from our team will reach out to you soon."
 
-CALL ENDING
-- End only when: lead is fully collected and confirmed, caller says they're done, or caller goes silent after reprompting.
-- Never end while collecting contact details or immediately after asking a question.
-
-OUTPUT FORMAT
-Respond with valid JSON only. No markdown, no code fences, no extra text.
-{
-  "spoken": "exact text Marie says aloud",
-  "intent": "info | qualify | collect_name | collect_phone | collect_email | confirm_lead | close",
-  "lead": { "name": "", "phone": "", "email": "" },
-  "save_lead": false,
-  "end_call": false,
-  "reason": "continue | lead_captured | caller_done | no_response"
-}
-
-INTENT GUIDE:
-- "info" — answering a question or providing information
-- "qualify" — probing for interest level or project scope before collecting lead
-- "collect_name" / "collect_phone" / "collect_email" — actively requesting that specific field
-- "confirm_lead" — all 3 fields collected, confirming with caller
-- "close" — ending the conversation
-
-FIELD RULES:
-- "spoken" — natural spoken text, 1-3 sentences
-- "lead" — accumulates across turns, use empty string for unknown fields
-- "save_lead" — true ONLY when all 3 lead fields present AND confirmed with caller
-- "end_call" — true ONLY when conversation should end after this message
-- "reason" — why (or "continue" if conversation continues)
+ENDING THE CALL
+- Only end when: all contact info is collected and confirmed, the caller says they're done, or they go silent after you've prompted them.
+- Never end while you're still collecting info or right after asking a question.
+- When ending, say goodbye naturally. Don't just stop.
 `;
 
 const SYSTEM_PROMPTS: Record<string, string> = {
@@ -576,35 +536,49 @@ function streamTtsResponse(c: any, ttsResponse: Response, extraHeaders?: Record<
 // Parse + validate assistant JSON
 // ---------------------------------------------------------------------------
 
-const DEFAULT_RESPONSE: AssistantResponse = {
-  spoken: "I'm sorry, could you say that again?",
-  intent: "info",
-  lead: { name: "", phone: "", email: "" },
-  save_lead: false,
-  end_call: false,
-  reason: "continue",
-};
+// ---------------------------------------------------------------------------
+// Extract lead fields from conversation text using simple pattern matching
+// ---------------------------------------------------------------------------
 
-function parseAssistantResponse(raw: string): AssistantResponse {
-  try {
-    const parsed = JSON.parse(raw);
-    return {
-      spoken: typeof parsed.spoken === "string" && parsed.spoken.trim() ? parsed.spoken.trim() : DEFAULT_RESPONSE.spoken,
-      intent: typeof parsed.intent === "string" ? parsed.intent : "info",
-      lead: {
-        name: typeof parsed.lead?.name === "string" ? parsed.lead.name : "",
-        phone: typeof parsed.lead?.phone === "string" ? parsed.lead.phone : "",
-        email: typeof parsed.lead?.email === "string" ? parsed.lead.email : "",
-      },
-      save_lead: parsed.save_lead === true,
-      end_call: parsed.end_call === true,
-      reason: typeof parsed.reason === "string" ? parsed.reason : "continue",
-    };
-  } catch {
-    // Fallback: treat raw text as spoken content
-    const spoken = raw.trim() || DEFAULT_RESPONSE.spoken;
-    return { ...DEFAULT_RESPONSE, spoken };
+const EMAIL_REGEX = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/;
+const PHONE_REGEX = /(?:\+?1[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)?\d{3}[-.\s]?\d{4}/;
+
+function extractLeadFromText(text: string, currentLead: LeadState, history: { role: string; content: string }[]): LeadState {
+  const updated = { ...currentLead };
+
+  // Extract email if not already captured
+  if (!updated.email) {
+    const emailMatch = text.match(EMAIL_REGEX);
+    if (emailMatch) updated.email = emailMatch[0];
   }
+
+  // Extract phone if not already captured
+  if (!updated.phone) {
+    const phoneMatch = text.match(PHONE_REGEX);
+    if (phoneMatch) updated.phone = phoneMatch[0].replace(/[^\d+]/g, "");
+  }
+
+  // Extract name: if the last assistant message asked for a name and this response
+  // is short text without email/phone, treat it as a name
+  if (!updated.name && history.length > 0) {
+    const lastAssistant = [...history].reverse().find(m => m.role === "assistant");
+    const askedForName = lastAssistant && /(?:name|who am i speaking|who['']?s calling)/i.test(lastAssistant.content);
+    if (askedForName) {
+      // Clean text: remove filler, just get the name
+      const cleaned = text.replace(/^(my name is|it's|i'm|this is|hey |hi )/i, "").trim();
+      if (cleaned.length > 1 && cleaned.length < 60 && !EMAIL_REGEX.test(cleaned) && !PHONE_REGEX.test(cleaned)) {
+        updated.name = cleaned;
+      }
+    }
+  }
+
+  return updated;
+}
+
+// Detect if the caller wants to end the conversation
+function detectEndCall(text: string): boolean {
+  const endings = /\b(goodbye|bye|that'?s it|that'?s all|i'?m done|no thanks|no thank you|gotta go|have a good|take care)\b/i;
+  return endings.test(text);
 }
 
 function isCompleteLead(lead: LeadState): boolean {
@@ -844,20 +818,26 @@ app.post("/api/voice/chat", async (c) => {
     return c.json({ error: "Input too long" }, 400);
   }
 
-  // Build system prompt with dynamic lead state
+  // Build system prompt with lead context
   let systemPrompt = SYSTEM_PROMPTS[industry] ?? SYSTEM_PROMPTS.other;
+  const currentLead: LeadState = lead || { name: "", phone: "", email: "" };
 
-  if (lead && (lead.name || lead.phone || lead.email)) {
+  if (currentLead.name || currentLead.phone || currentLead.email) {
+    const collected = [
+      currentLead.name ? `Name: ${currentLead.name}` : null,
+      currentLead.phone ? `Phone: ${currentLead.phone}` : null,
+      currentLead.email ? `Email: ${currentLead.email}` : null,
+    ].filter(Boolean).join(", ");
     const missing = [
-      !lead.name ? "name" : null,
-      !lead.phone ? "phone" : null,
-      !lead.email ? "email" : null,
+      !currentLead.name ? "name" : null,
+      !currentLead.phone ? "phone" : null,
+      !currentLead.email ? "email" : null,
     ].filter(Boolean);
-    systemPrompt += `\n\nCURRENT LEAD STATE: ${JSON.stringify(lead)}`;
+    systemPrompt += `\n\nYou already have: ${collected}.`;
     if (missing.length > 0) {
-      systemPrompt += `\nStill needed: ${missing.join(", ")}. Collect these one at a time when appropriate.`;
+      systemPrompt += ` Still need: ${missing.join(", ")}. Collect one at a time when appropriate.`;
     } else {
-      systemPrompt += `\nAll fields collected. Confirm with the caller, set save_lead to true.`;
+      systemPrompt += ` All info collected. Confirm with the caller and wrap up.`;
     }
   }
 
@@ -872,51 +852,64 @@ app.post("/api/voice/chat", async (c) => {
     { role: "user", content: text.trim() },
   ];
 
-  // 1. Get structured AI response
-  let aiRaw: string;
+  // 1. Get plain text response (no JSON)
+  let spoken: string;
   try {
     const completion = await openai.chat.completions.create({
       model: LLM_MODEL,
       messages,
-      max_tokens: 400,
-      temperature: 0.2,
-      response_format: { type: "json_object" },
+      max_tokens: 300,
+      temperature: 0.4,
     });
-    aiRaw = completion.choices[0]?.message?.content?.trim() ?? "";
+    spoken = completion.choices[0]?.message?.content?.trim() ?? "";
   } catch (err) {
     console.error("[GloVoice] LLM error:", err);
     return c.json({ error: "AI service error" }, 502);
   }
 
-  const response = parseAssistantResponse(aiRaw);
+  if (!spoken) spoken = "I'm sorry, could you say that again?";
 
-  // 2. Save lead if flagged and complete
-  if (response.save_lead && isCompleteLead(response.lead)) {
-    // Save to Supabase
+  // Strip any accidental JSON or markdown the model might output
+  if (spoken.startsWith("{") || spoken.startsWith("```")) {
+    try {
+      const parsed = JSON.parse(spoken.replace(/```json?\n?/g, "").replace(/```/g, ""));
+      spoken = parsed.spoken || parsed.text || parsed.response || spoken;
+    } catch {
+      // Not JSON, use as-is
+    }
+  }
+
+  // 2. Extract lead info from the caller's message
+  const updatedLead = extractLeadFromText(text, currentLead, recentHistory);
+  const endCall = detectEndCall(text);
+
+  // 3. Save lead if all fields collected (first time only)
+  const leadJustCompleted = isCompleteLead(updatedLead) && !isCompleteLead(currentLead);
+  if (leadJustCompleted) {
     if (supabase) {
       try {
         await supabase.from("voice_leads").insert({
-          name: response.lead.name,
-          phone: response.lead.phone,
-          email: response.lead.email,
+          name: updatedLead.name,
+          phone: updatedLead.phone,
+          email: updatedLead.email,
           industry,
           source: "voice_demo",
         });
-        console.log(`[GloVoice] Lead saved: ${response.lead.name} / ${response.lead.email}`);
+        console.log(`[GloVoice] Lead saved: ${updatedLead.name} / ${updatedLead.email}`);
       } catch (err) {
         console.error("[GloVoice] Failed to save lead:", err);
       }
     }
 
-    // Send confirmation email + Telegram alert (fire-and-forget, don't block TTS)
-    sendLeadConfirmationEmail(response.lead, industry);
-    sendTelegramLeadAlert(response.lead, industry);
+    // Send confirmation email + Telegram alert (fire-and-forget)
+    sendLeadConfirmationEmail(updatedLead, industry);
+    sendTelegramLeadAlert(updatedLead, industry);
   }
 
-  // 3. Convert spoken text to speech
+  // 4. Convert to speech
   let ttsResponse: Response;
   try {
-    ttsResponse = await textToSpeech(response.spoken);
+    ttsResponse = await textToSpeech(spoken);
   } catch (err) {
     console.error("[GloVoice] TTS error:", err);
     return c.json({ error: "TTS service error" }, 502);
@@ -928,9 +921,18 @@ app.post("/api/voice/chat", async (c) => {
     return c.json({ error: "TTS generation failed" }, 502);
   }
 
-  // 4. Stream audio back with structured metadata
+  // 5. Stream audio back with metadata for frontend
+  const responsePayload: AssistantResponse = {
+    spoken,
+    intent: "info",
+    lead: updatedLead,
+    save_lead: leadJustCompleted,
+    end_call: endCall,
+    reason: endCall ? "caller_done" : leadJustCompleted ? "lead_captured" : "continue",
+  };
+
   return streamTtsResponse(c, ttsResponse, {
-    "X-Response": encodeURIComponent(JSON.stringify(response)),
+    "X-Response": encodeURIComponent(JSON.stringify(responsePayload)),
   });
 });
 
