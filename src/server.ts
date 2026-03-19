@@ -9,6 +9,7 @@ import { cors } from "hono/cors";
 import { stream } from "hono/streaming";
 import OpenAI from "openai";
 import { createClient } from "@supabase/supabase-js";
+import { VoiceSession } from "./ws/voice-session";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -646,13 +647,71 @@ app.post("/api/voice/chat", async (c) => {
 });
 
 // ---------------------------------------------------------------------------
-// Start
+// Start — HTTP (Hono) + WebSocket (voice sessions)
 // ---------------------------------------------------------------------------
 
 const port = parseInt(process.env.PORT || "3001");
-console.log(`[GloVoice] Listening on port ${port}`);
 
-export default {
+const sessions = new Map<string, VoiceSession>();
+
+const server = Bun.serve({
   port,
-  fetch: app.fetch,
-};
+  fetch(req, server) {
+    const url = new URL(req.url);
+
+    // WebSocket upgrade for voice sessions
+    if (url.pathname === "/ws/voice") {
+      // CORS check on WebSocket upgrade
+      const origin = req.headers.get("origin") || "";
+      if (origin && !ALLOWED_ORIGINS.includes(origin)) {
+        return new Response("Forbidden origin", { status: 403 });
+      }
+
+      const upgraded = server.upgrade(req, {
+        data: { sessionId: crypto.randomUUID() },
+      });
+      if (!upgraded) return new Response("Upgrade failed", { status: 400 });
+      return undefined;
+    }
+
+    // Fall through to Hono for all HTTP routes
+    return app.fetch(req);
+  },
+  websocket: {
+    open(ws) {
+      const session = new VoiceSession(ws);
+      sessions.set((ws.data as any).sessionId, session);
+      ws.send(JSON.stringify({ type: "session_ready" }));
+      console.log(`[GloVoice] WebSocket opened: ${(ws.data as any).sessionId}`);
+    },
+    message(ws, message) {
+      const session = sessions.get((ws.data as any).sessionId);
+      if (!session) return;
+
+      if (typeof message === "string") {
+        try {
+          const data = JSON.parse(message);
+          session.handleControl(data);
+        } catch (err) {
+          console.error("[GloVoice] Invalid WS JSON:", err);
+          ws.send(JSON.stringify({ type: "error", message: "Invalid JSON" }));
+        }
+      } else {
+        // Binary frame = PCM audio
+        session.onAudioFrame(message instanceof ArrayBuffer ? message : message.buffer);
+      }
+    },
+    close(ws) {
+      const sessionId = (ws.data as any).sessionId;
+      const session = sessions.get(sessionId);
+      session?.cleanup();
+      sessions.delete(sessionId);
+      console.log(`[GloVoice] WebSocket closed: ${sessionId}`);
+    },
+    perMessageDeflate: false,
+    maxPayloadLength: 64 * 1024,
+    idleTimeout: 300,
+  },
+});
+
+console.log(`[GloVoice] Listening on port ${port} (HTTP + WebSocket)`);
