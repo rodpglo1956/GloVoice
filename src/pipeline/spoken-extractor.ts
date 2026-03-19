@@ -17,6 +17,8 @@ export class SpokenExtractor {
   private onToken: (text: string) => void;
   /** Track escape sequences inside the spoken string */
   private escaped = false;
+  /** Whether any content was actually forwarded to TTS */
+  private forwarded = false;
 
   constructor(onToken: (text: string) => void) {
     this.onToken = onToken;
@@ -52,8 +54,14 @@ export class SpokenExtractor {
   }
 
   /**
-   * Force flush — if we never found "spoken", the LLM may have returned
-   * plain text (no JSON). In that case, return accumulated as-is for fallback.
+   * Whether any spoken content was forwarded to the callback.
+   */
+  hasForwarded(): boolean {
+    return this.forwarded;
+  }
+
+  /**
+   * Get the full accumulated LLM output (for parsing flags after stream ends).
    */
   getAccumulated(): string {
     return this.accumulated;
@@ -109,6 +117,7 @@ export class SpokenExtractor {
     }
 
     if (output) {
+      this.forwarded = true;
       this.onToken(output);
     }
   }

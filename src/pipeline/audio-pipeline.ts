@@ -240,11 +240,18 @@ export async function streamLLMToTTS(
   // Flush any remaining tokens after LLM stream completes
   tokenBuffer.forceFlush();
 
-  // Signal end of text input to ElevenLabs
-  elevenlabs.endStream();
-
   // Parse the full accumulated response for flags
   const parsed = parseStreamedResponse(fullResponse);
+
+  // Fallback: if SpokenExtractor never found "spoken" in the stream
+  // (LLM returned plain text, or JSON was malformed), send parsed spoken text directly
+  if (!spokenExtractor.hasForwarded() && parsed.spoken) {
+    console.log("[AudioPipeline] SpokenExtractor missed — sending parsed fallback to TTS");
+    elevenlabs.sendText(parsed.spoken, true);
+  }
+
+  // Signal end of text input to ElevenLabs
+  elevenlabs.endStream();
 
   // Notify caller of the full spoken text
   onSpoken(parsed.spoken);
