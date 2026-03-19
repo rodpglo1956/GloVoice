@@ -679,7 +679,31 @@ const server = Bun.serve({
   },
   websocket: {
     open(ws) {
-      const session = new VoiceSession(ws);
+      const session = new VoiceSession(ws, {
+        openaiClient: openai,
+        llmModel: LLM_MODEL,
+        elevenLabsVoiceId: ELEVENLABS_VOICE_ID,
+        elevenLabsApiKey: ELEVENLABS_API_KEY,
+        buildPrompt,
+        onLeadCaptured: (lead, industry) => {
+          // Save to Supabase
+          if (supabase && isCompleteLead(lead)) {
+            supabase.from("voice_leads").insert({
+              name: lead.name,
+              phone: lead.phone,
+              email: lead.email,
+              industry,
+              source: "voice_demo_ws",
+            }).then(({ error }) => {
+              if (error) console.error("[GloVoice] Lead save error:", error);
+              else console.log(`[GloVoice] WS lead saved: ${lead.name}`);
+            });
+          }
+          // Fire-and-forget: email + Telegram
+          sendLeadConfirmationEmail(lead, industry);
+          sendTelegramLeadAlert(lead, industry);
+        },
+      });
       sessions.set((ws.data as any).sessionId, session);
       ws.send(JSON.stringify({ type: "session_ready" }));
       console.log(`[GloVoice] WebSocket opened: ${(ws.data as any).sessionId}`);

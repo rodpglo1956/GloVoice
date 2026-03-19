@@ -1,9 +1,16 @@
 /**
  * VoiceSession — Per-connection state machine for streaming voice pipeline.
- * Manages Deepgram STT connection, audio forwarding, and transcript delivery.
+ * Manages Deepgram STT connection, audio forwarding, LLM-to-TTS pipeline,
+ * and transcript delivery.
  */
 
 import { createDeepgramConnection, type DeepgramConnection } from "./deepgram-client";
+import {
+  streamLLMToTTS,
+  type LeadState,
+  type StreamLLMToTTSResult,
+} from "../pipeline/audio-pipeline";
+import type OpenAI from "openai";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -22,6 +29,16 @@ interface ConversationEntry {
   content: string;
 }
 
+/** Config passed from server.ts at construction time */
+export interface VoiceSessionConfig {
+  openaiClient: OpenAI;
+  llmModel: string;
+  elevenLabsVoiceId: string;
+  elevenLabsApiKey: string;
+  buildPrompt: (industry: string) => string;
+  onLeadCaptured?: (lead: LeadState, industry: string) => void;
+}
+
 // ---------------------------------------------------------------------------
 // VoiceSession
 // ---------------------------------------------------------------------------
@@ -33,9 +50,15 @@ export class VoiceSession {
   private industry: string = "other";
   private conversationHistory: ConversationEntry[] = [];
   private keepAliveInterval: ReturnType<typeof setInterval> | null = null;
+  private lead: LeadState = { name: "", phone: "", email: "" };
+  private config: VoiceSessionConfig;
 
-  constructor(browserWs: { send(data: string | ArrayBuffer): number }) {
+  constructor(
+    browserWs: { send(data: string | ArrayBuffer): number },
+    config: VoiceSessionConfig
+  ) {
     this.browserWs = browserWs;
+    this.config = config;
   }
 
   // -------------------------------------------------------------------------
@@ -61,15 +84,14 @@ export class VoiceSession {
   /**
    * Handle binary audio frames from the browser.
    * Only forwards to Deepgram when in 'listening' state.
-   * Mutes during 'speaking' state to prevent echo hallucination.
+   * Mutes during 'speaking' and 'processing' states to prevent echo.
    */
   onAudioFrame(data: ArrayBuffer): void {
     if (this.state === "listening" && this.deepgram) {
       this.deepgram.send(data);
     }
-    // During 'speaking' state: audio is intentionally dropped to prevent
-    // TTS playback from being transcribed back (echo hallucination).
-    // Future: VAD stub -- could detect barge-in during speaking state.
+    // During 'speaking'/'processing' state: audio is intentionally dropped
+    // to prevent TTS playback from being transcribed back (echo hallucination).
   }
 
   /**
@@ -85,6 +107,7 @@ export class VoiceSession {
 
     this.setState("idle");
     this.conversationHistory = [];
+    this.lead = { name: "", phone: "", email: "" };
     console.log("[VoiceSession] Cleaned up");
   }
 
@@ -96,7 +119,7 @@ export class VoiceSession {
   }
 
   /**
-   * Get conversation history (for future LLM integration).
+   * Get conversation history.
    */
   getHistory(): ConversationEntry[] {
     return this.conversationHistory;
@@ -138,7 +161,7 @@ export class VoiceSession {
   }
 
   // -------------------------------------------------------------------------
-  // Private
+  // Private: Listening / STT
   // -------------------------------------------------------------------------
 
   private startListening(industry: string): void {
@@ -153,6 +176,7 @@ export class VoiceSession {
     this.deepgram = createDeepgramConnection(
       // onTranscript
       (text: string, isFinal: boolean) => {
+        // Send transcript to browser for display
         this.sendToBrowser({
           type: "transcript",
           text,
@@ -161,6 +185,8 @@ export class VoiceSession {
 
         if (isFinal && text.trim()) {
           this.addToHistory("user", text.trim());
+          // Trigger the LLM → TTS streaming pipeline
+          this.handleFinalTranscript(text.trim());
         }
       },
       // onError
@@ -183,6 +209,85 @@ export class VoiceSession {
     console.log(`[VoiceSession] Started listening for industry: ${industry}`);
   }
 
+  // -------------------------------------------------------------------------
+  // Private: LLM → TTS Pipeline
+  // -------------------------------------------------------------------------
+
+  /**
+   * Called when Deepgram returns a final transcript.
+   * Triggers the streaming pipeline: LLM → TokenBuffer → ElevenLabs → browser.
+   */
+  private async handleFinalTranscript(userText: string): Promise<void> {
+    // Transition to processing
+    this.setState("processing");
+
+    const systemPrompt = this.config.buildPrompt(this.industry);
+    let firstAudioReceived = false;
+
+    try {
+      const result: StreamLLMToTTSResult = await streamLLMToTTS({
+        userText,
+        systemPrompt,
+        history: this.conversationHistory,
+        lead: this.lead,
+        openaiClient: this.config.openaiClient,
+        llmModel: this.config.llmModel,
+        voiceId: this.config.elevenLabsVoiceId,
+        elevenLabsApiKey: this.config.elevenLabsApiKey,
+
+        // onAudio: send binary PCM to browser, set speaking state on first chunk
+        onAudio: (pcmBuffer: ArrayBuffer) => {
+          if (!firstAudioReceived) {
+            firstAudioReceived = true;
+            this.setSpeaking();
+          }
+          this.sendBinaryToBrowser(pcmBuffer);
+        },
+
+        // onSpoken: add assistant response to conversation history
+        onSpoken: (fullText: string) => {
+          this.addToHistory("assistant", fullText);
+        },
+
+        // onDone: all audio finished
+        onDone: () => {
+          // Handled after the await below
+        },
+      });
+
+      // Handle lead capture
+      if (result.save_lead) {
+        // Merge any lead data from the LLM response
+        if (result.lead.name) this.lead.name = result.lead.name;
+        if (result.lead.phone) this.lead.phone = result.lead.phone;
+        if (result.lead.email) this.lead.email = result.lead.email;
+
+        // Notify server for Supabase save + email + Telegram
+        this.config.onLeadCaptured?.(this.lead, this.industry);
+      }
+
+      // Handle end call
+      if (result.end_call) {
+        this.sendToBrowser({ type: "end_call" });
+        return; // Don't resume listening
+      }
+
+      // Resume listening for next user utterance
+      this.resumeListening();
+    } catch (err) {
+      console.error("[VoiceSession] Pipeline error:", err);
+      this.sendToBrowser({
+        type: "error",
+        message: "Processing error",
+      });
+      this.resumeListening();
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Private: State + Messaging
+  // -------------------------------------------------------------------------
+
   private setState(newState: SessionState): void {
     const oldState = this.state;
     this.state = newState;
@@ -200,6 +305,14 @@ export class VoiceSession {
       this.browserWs.send(JSON.stringify(data));
     } catch (err) {
       console.error("[VoiceSession] Failed to send to browser:", err);
+    }
+  }
+
+  private sendBinaryToBrowser(buffer: ArrayBuffer): void {
+    try {
+      this.browserWs.send(buffer);
+    } catch (err) {
+      console.error("[VoiceSession] Failed to send binary to browser:", err);
     }
   }
 
