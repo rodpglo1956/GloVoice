@@ -7,6 +7,7 @@
 
 import type OpenAI from "openai";
 import { TokenBuffer } from "./token-buffer";
+import { SpokenExtractor } from "./spoken-extractor";
 import { createElevenLabsWS } from "../ws/elevenlabs-client";
 
 // ---------------------------------------------------------------------------
@@ -186,6 +187,13 @@ export async function streamLLMToTTS(
     elevenlabs.sendText(chunk, true);
   });
 
+  // --- Spoken Extractor ---
+  // LLM outputs JSON: {"spoken":"...","save_lead":false,...}
+  // We only want to send the "spoken" value to TTS, not the JSON syntax.
+  const spokenExtractor = new SpokenExtractor((text: string) => {
+    tokenBuffer.add(text);
+  });
+
   // --- LLM Streaming ---
   const fullSystemPrompt = systemPrompt + buildLeadContext(lead);
 
@@ -214,7 +222,7 @@ export async function streamLLMToTTS(
       const token = chunk.choices[0]?.delta?.content;
       if (token) {
         fullResponse += token;
-        tokenBuffer.add(token);
+        spokenExtractor.add(token);
       }
     }
   } catch (err) {
