@@ -60,6 +60,10 @@ export class VoiceSession {
   private activeElevenLabsClose: (() => void) | null = null;
   /** Timestamp of last speech_final / utterance_end from Deepgram */
   private speechEndTime = 0;
+  /** Timestamp when first audio chunk sent to browser for current turn */
+  private firstAudioSentTime = 0;
+  /** Whether this is the greeting turn (no user input yet) */
+  private isGreeting = false;
 
   constructor(
     browserWs: { send(data: string | ArrayBuffer): number },
@@ -248,11 +252,17 @@ export class VoiceSession {
     this.deepgram = createDeepgramConnection(
       // onTranscript
       (text: string, isFinal: boolean) => {
-        // Send transcript to browser for display
+        if (isFinal) {
+          // Record when user stopped speaking (for latency measurement)
+          this.speechEndTime = Date.now();
+        }
+
+        // Send transcript to browser for display (include speechEndTime for client-side latency)
         this.sendToBrowser({
           type: "transcript",
           text,
           final: isFinal,
+          ...(isFinal ? { speechEndTime: this.speechEndTime } : {}),
         });
 
         if (isFinal && text.trim()) {
@@ -275,10 +285,82 @@ export class VoiceSession {
       }
     );
 
-    this.setState("listening");
     this.startKeepAlive();
 
     console.log(`[VoiceSession] Started listening for industry: ${industry}`);
+
+    // Trigger greeting immediately
+    this.playGreeting();
+  }
+
+  // -------------------------------------------------------------------------
+  // Private: Greeting
+  // -------------------------------------------------------------------------
+
+  /**
+   * Play an initial greeting through the streaming pipeline.
+   * Uses the same LLM→TTS flow so the greeting is streamed with low latency.
+   */
+  private async playGreeting(): Promise<void> {
+    this.isGreeting = true;
+
+    const industryNames: Record<string, string> = {
+      transportation: "Transportation",
+      commercial: "Commercial Services",
+      trades: "Trades",
+      health: "Health & Wellness",
+      realestate: "Real Estate",
+      automotive: "Automotive",
+      beauty: "Beauty",
+      food: "Food & Hospitality",
+      other: "Business Services",
+    };
+    const industryLabel = industryNames[this.industry] || industryNames.other;
+
+    const greetingPrompt = `You are starting a new call. Greet the caller warmly. Say something like: "Hey, this is Marie with Glo Matrix. I see you're interested in our ${industryLabel} solutions. Tell me a little about your business and I'll show you what we can do." Keep it natural and under 2 sentences. Output valid JSON: {"spoken":"your greeting","save_lead":false,"end_call":false}`;
+
+    const systemPrompt = this.config.buildPrompt(this.industry);
+    let firstAudioReceived = false;
+
+    try {
+      await streamLLMToTTS({
+        userText: greetingPrompt,
+        systemPrompt,
+        history: [],
+        lead: this.lead,
+        openaiClient: this.config.openaiClient,
+        llmModel: this.config.llmModel,
+        voiceId: this.config.elevenLabsVoiceId,
+        elevenLabsApiKey: this.config.elevenLabsApiKey,
+
+        onTTSReady: (closeFn: () => void) => {
+          this.activeElevenLabsClose = closeFn;
+        },
+
+        onAudio: (pcmBuffer: ArrayBuffer) => {
+          if (!firstAudioReceived) {
+            firstAudioReceived = true;
+            this.setSpeaking();
+          }
+          this.sendBinaryToBrowser(pcmBuffer);
+        },
+
+        onSpoken: (fullText: string) => {
+          this.addToHistory("assistant", fullText);
+        },
+
+        onDone: () => {},
+      });
+
+      // After greeting, start listening
+      this.isGreeting = false;
+      this.activeElevenLabsClose = null;
+      this.resumeListening();
+    } catch (err) {
+      console.error("[VoiceSession] Greeting error:", err);
+      this.isGreeting = false;
+      this.setState("listening");
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -295,6 +377,7 @@ export class VoiceSession {
 
     const systemPrompt = this.config.buildPrompt(this.industry);
     let firstAudioReceived = false;
+    this.firstAudioSentTime = 0;
 
     try {
       const result: StreamLLMToTTSResult = await streamLLMToTTS({
@@ -316,7 +399,14 @@ export class VoiceSession {
         onAudio: (pcmBuffer: ArrayBuffer) => {
           if (!firstAudioReceived) {
             firstAudioReceived = true;
+            this.firstAudioSentTime = Date.now();
             this.setSpeaking();
+
+            // Log server-side latency
+            if (this.speechEndTime > 0) {
+              const latency = this.firstAudioSentTime - this.speechEndTime;
+              console.log(`[GloVoice] Server-side latency: ${latency}ms`);
+            }
           }
           this.sendBinaryToBrowser(pcmBuffer);
         },
