@@ -1,10 +1,11 @@
 /**
  * VAD Processor — Server-side Voice Activity Detection for barge-in.
- * Uses avr-vad (ONNX-based Silero VAD) to detect when the user speaks
- * while the agent is playing TTS audio (barge-in detection).
+ * Uses energy-based detection (RMS threshold) instead of ONNX/Silero
+ * to avoid native binary compatibility issues on Railway/Bun.
+ *
+ * For barge-in, we only need to detect "is the user talking while Marie
+ * is speaking?" — energy-based detection is sufficient for this.
  */
-
-import { RealTimeVAD } from "avr-vad";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -15,58 +16,66 @@ export interface VADProcessor {
    * Process a PCM audio frame. Returns true if speech is detected.
    * Input: Int16 PCM ArrayBuffer at 16kHz mono.
    */
-  processFrame(pcmBuffer: ArrayBuffer): Promise<boolean>;
+  processFrame(pcmBuffer: ArrayBuffer): boolean;
   /** Reset VAD state (e.g., after a barge-in is handled). */
   reset(): void;
 }
+
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+
+const RMS_THRESHOLD = 800; // Int16 RMS threshold for "speech" (tune as needed)
+const SPEECH_FRAMES_REQUIRED = 3; // Consecutive frames above threshold to trigger
+const SILENCE_FRAMES_REQUIRED = 5; // Consecutive frames below threshold to clear
 
 // ---------------------------------------------------------------------------
 // Factory
 // ---------------------------------------------------------------------------
 
 /**
- * Create a VAD processor backed by avr-vad (Silero VAD v5).
- *
- * Returns null if initialization fails (caller should handle gracefully).
+ * Create an energy-based VAD processor.
+ * No external dependencies, works on any runtime.
  */
-export async function createVADProcessor(): Promise<VADProcessor | null> {
-  try {
-    const vad = await RealTimeVAD.new({
-      model: "v5",
-      positiveSpeechThreshold: 0.5,
-      negativeSpeechThreshold: 0.35,
-      frameSamples: 1536,
-    });
+export function createVADProcessor(): VADProcessor {
+  let speechFrameCount = 0;
+  let silenceFrameCount = 0;
+  let isSpeaking = false;
 
-    return {
-      async processFrame(pcmBuffer: ArrayBuffer): Promise<boolean> {
-        // Convert Int16 PCM to Float32 [-1, 1] for VAD
-        const int16 = new Int16Array(pcmBuffer);
-        const float32 = new Float32Array(int16.length);
-        for (let i = 0; i < int16.length; i++) {
-          float32[i] = int16[i] / 32768;
-        }
+  return {
+    processFrame(pcmBuffer: ArrayBuffer): boolean {
+      const int16 = new Int16Array(pcmBuffer);
 
-        try {
-          const result = await vad.processFrame(float32);
-          return (
-            result.msg === "SPEECH_START" || result.msg === "SPEECH_CONTINUE"
-          );
-        } catch {
-          return false;
-        }
-      },
+      // Calculate RMS energy
+      let sumSquares = 0;
+      for (let i = 0; i < int16.length; i++) {
+        sumSquares += int16[i] * int16[i];
+      }
+      const rms = Math.sqrt(sumSquares / int16.length);
 
-      reset(): void {
-        try {
-          vad.reset();
-        } catch {
-          // ignore reset errors
+      if (rms > RMS_THRESHOLD) {
+        speechFrameCount++;
+        silenceFrameCount = 0;
+
+        if (speechFrameCount >= SPEECH_FRAMES_REQUIRED) {
+          isSpeaking = true;
         }
-      },
-    };
-  } catch (err) {
-    console.error("[VAD] Failed to initialize avr-vad:", err);
-    return null;
-  }
+      } else {
+        silenceFrameCount++;
+        speechFrameCount = 0;
+
+        if (silenceFrameCount >= SILENCE_FRAMES_REQUIRED) {
+          isSpeaking = false;
+        }
+      }
+
+      return isSpeaking;
+    },
+
+    reset(): void {
+      speechFrameCount = 0;
+      silenceFrameCount = 0;
+      isSpeaking = false;
+    },
+  };
 }

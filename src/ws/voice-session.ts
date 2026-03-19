@@ -71,15 +71,9 @@ export class VoiceSession {
   ) {
     this.browserWs = browserWs;
     this.config = config;
-    // Initialize VAD asynchronously
-    createVADProcessor().then((vad) => {
-      this.vadProcessor = vad;
-      if (vad) {
-        console.log("[VoiceSession] VAD processor initialized (avr-vad)");
-      } else {
-        console.warn("[VoiceSession] VAD unavailable — barge-in via Deepgram VAD events only");
-      }
-    });
+    // Initialize energy-based VAD (synchronous, no native deps)
+    this.vadProcessor = createVADProcessor();
+    console.log("[VoiceSession] VAD processor initialized (energy-based)");
   }
 
   // -------------------------------------------------------------------------
@@ -116,18 +110,16 @@ export class VoiceSession {
         this.deepgram.send(data);
       }
       // Run VAD for barge-in detection
-      if (this.vadProcessor) {
-        this.vadProcessor.processFrame(data).then((isSpeech) => {
-          if (this.state !== "speaking") return; // state changed while awaiting
-          if (isSpeech) {
-            this.consecutiveSpeechFrames++;
-            if (this.consecutiveSpeechFrames >= VoiceSession.BARGE_IN_THRESHOLD) {
-              this.handleBargeIn();
-            }
-          } else {
-            this.consecutiveSpeechFrames = 0;
+      if (this.vadProcessor && this.state === "speaking") {
+        const isSpeech = this.vadProcessor.processFrame(data);
+        if (isSpeech) {
+          this.consecutiveSpeechFrames++;
+          if (this.consecutiveSpeechFrames >= VoiceSession.BARGE_IN_THRESHOLD) {
+            this.handleBargeIn();
           }
-        });
+        } else {
+          this.consecutiveSpeechFrames = 0;
+        }
       }
     }
     // During 'processing' state: audio is intentionally dropped
