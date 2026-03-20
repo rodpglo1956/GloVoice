@@ -99,7 +99,9 @@ export function createDeepgramConnection(
       const transcript = data.channel?.alternatives?.[0]?.transcript ?? "";
       if (!transcript) return;
 
-      const isFinal = data.speech_final === true || data.is_final === true;
+      // ONLY use speech_final — is_final fires on every segment boundary (mid-sentence).
+      // speech_final fires when Deepgram detects the user actually stopped talking.
+      const isFinal = data.speech_final === true;
       onTranscript(transcript, isFinal);
     } catch (err) {
       console.error("[Deepgram] Failed to parse message:", err);
