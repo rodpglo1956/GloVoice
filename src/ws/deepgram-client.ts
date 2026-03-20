@@ -1,6 +1,10 @@
 /**
  * Deepgram Nova-3 streaming STT client
  * Uses raw WebSocket to Deepgram's live transcription API (no SDK dependency).
+ *
+ * End-of-speech detection uses dual-trigger pattern (Deepgram recommended):
+ *   1. speech_final: true — primary (endpointing VAD detected silence)
+ *   2. UtteranceEnd — fallback (speech_final has known bugs with smart_format)
  */
 
 const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY || "";
@@ -23,13 +27,6 @@ interface DeepgramTranscriptResult {
   type?: string;
 }
 
-/**
- * Create a live Deepgram connection for streaming STT.
- *
- * @param onTranscript - Called with (text, isFinal) when Deepgram returns a transcript
- * @param onError - Called on connection errors
- * @param onClose - Called when the connection closes
- */
 export function createDeepgramConnection(
   onTranscript: (text: string, isFinal: boolean) => void,
   onError?: (error: Error) => void,
@@ -52,9 +49,10 @@ export function createDeepgramConnection(
     sample_rate: "16000",
     channels: "1",
     smart_format: "true",
+    no_delay: "true",
     interim_results: "true",
-    utterance_end_ms: "1500",
-    endpointing: "800",
+    utterance_end_ms: "1200",
+    endpointing: "600",
     vad_events: "true",
   });
 
@@ -62,6 +60,10 @@ export function createDeepgramConnection(
 
   let ws: WebSocket | null = null;
   let open = false;
+
+  // Track last transcript for UtteranceEnd fallback
+  let lastTranscript = "";
+  let speechFinalFired = false;
 
   try {
     ws = new WebSocket(url, {
@@ -90,19 +92,39 @@ export function createDeepgramConnection(
       const data: DeepgramTranscriptResult =
         typeof event.data === "string" ? JSON.parse(event.data) : {};
 
-      // VAD events and metadata don't have transcripts
+      // UtteranceEnd — fallback trigger when speech_final never fires
+      // (known Deepgram bug with smart_format, see Discussion #409/#747)
       if (data.type === "UtteranceEnd") {
-        // Utterance boundary -- treat as final empty if needed
+        if (!speechFinalFired && lastTranscript) {
+          console.log("[Deepgram] UtteranceEnd fallback — speech_final never fired");
+          onTranscript(lastTranscript, true);
+          lastTranscript = "";
+        }
+        speechFinalFired = false;
         return;
       }
 
       const transcript = data.channel?.alternatives?.[0]?.transcript ?? "";
       if (!transcript) return;
 
-      // ONLY use speech_final — is_final fires on every segment boundary (mid-sentence).
-      // speech_final fires when Deepgram detects the user actually stopped talking.
-      const isFinal = data.speech_final === true;
-      onTranscript(transcript, isFinal);
+      // speech_final: user stopped talking (endpointing VAD detected silence)
+      if (data.speech_final === true) {
+        speechFinalFired = true;
+        lastTranscript = "";
+        onTranscript(transcript, true);
+        return;
+      }
+
+      // is_final: segment done processing (NOT end of speech — fires mid-sentence)
+      // Store as last transcript for UtteranceEnd fallback, but don't trigger pipeline
+      if (data.is_final === true) {
+        lastTranscript = transcript;
+        onTranscript(transcript, false); // send as interim for UI display
+        return;
+      }
+
+      // Interim result — display only
+      onTranscript(transcript, false);
     } catch (err) {
       console.error("[Deepgram] Failed to parse message:", err);
     }
@@ -128,7 +150,6 @@ export function createDeepgramConnection(
 
     keepAlive() {
       if (ws && open) {
-        // Deepgram keepalive: send a JSON keepalive message
         ws.send(JSON.stringify({ type: "KeepAlive" }));
       }
     },
@@ -136,7 +157,6 @@ export function createDeepgramConnection(
     close() {
       if (ws) {
         open = false;
-        // Send CloseStream message for graceful shutdown
         try {
           ws.send(JSON.stringify({ type: "CloseStream" }));
         } catch {
