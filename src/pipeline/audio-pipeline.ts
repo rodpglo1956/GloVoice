@@ -173,7 +173,8 @@ export async function streamLLMToTTS(
   let elevenlabs: { sendText: (t: string, f?: boolean) => void; endStream: () => void; close: () => void };
   let isPersistent = false;
 
-  if (persistentElevenLabs && persistentElevenLabs.isConnected()) {
+  if (persistentElevenLabs) {
+    // Use persistent connection (queues messages if WS still connecting)
     const ctx = persistentElevenLabs.createContext(onAudioCallback, onDoneCallback);
     elevenlabs = ctx;
     isPersistent = true;
