@@ -104,8 +104,10 @@ export class VoiceSession {
     if (this.state === "listening" && this.deepgram) {
       this.deepgram.send(data);
     } else if (this.state === "speaking") {
-      if (this.deepgram) this.deepgram.send(data);
-      if (this.vadProcessor && this.state === "speaking") {
+      // Do NOT send audio to Deepgram during speaking — speaker echo gets
+      // transcribed as user speech, causing hallucination and false responses.
+      // Only run VAD for barge-in detection.
+      if (this.vadProcessor) {
         const isSpeech = this.vadProcessor.processFrame(data);
         if (isSpeech) {
           this.consecutiveSpeechFrames++;
@@ -116,9 +118,8 @@ export class VoiceSession {
           this.consecutiveSpeechFrames = 0;
         }
       }
-    } else if (this.state === "processing" && this.deepgram) {
-      this.deepgram.send(data);
     }
+    // During 'processing' state: don't feed Deepgram either (prevents echo transcription)
   }
 
   cleanup(): void {
