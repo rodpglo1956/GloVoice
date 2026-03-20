@@ -53,8 +53,8 @@ export function createDeepgramConnection(
     channels: "1",
     smart_format: "true",
     interim_results: "true",
-    utterance_end_ms: "1200",
-    endpointing: "500",
+    utterance_end_ms: "1500",
+    endpointing: "800",
     vad_events: "true",
   });
 
