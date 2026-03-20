@@ -1,35 +1,60 @@
 /**
  * ElevenLabs WebSocket TTS client — streams text in, receives PCM audio out.
  *
- * Protocol: wss://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream-input
- *   BOS  → { text: ' ', voice_settings, generation_config, xi_api_key }
- *   Text → { text: 'chunk', flush: false }
- *   Flush→ { text: 'end of sentence. ', flush: true }
- *   EOS  → { text: '' }
- *   Audio← { audio: 'base64_pcm_data', isFinal: false }
+ * Two modes:
+ * 1. Per-turn: createElevenLabsWS() — opens a new WS per turn (legacy)
+ * 2. Persistent: createPersistentElevenLabsWS() — reuses one WS across turns,
+ *    sending BOS/text/EOS cycles on the same connection (saves 150-300ms handshake)
  */
 
+// ---------------------------------------------------------------------------
+// Shared types
+// ---------------------------------------------------------------------------
+
 export interface ElevenLabsWSClient {
-  /** Send a text chunk. If flush=true, ElevenLabs generates audio immediately. Queues if WS not open yet. */
   sendText(text: string, flush?: boolean): void;
-  /** Send end-of-stream signal (EOS). */
   endStream(): void;
-  /** Force close the connection. */
   close(): void;
 }
 
-interface ElevenLabsConfig {
+export interface ElevenLabsConfig {
   voiceId: string;
   apiKey: string;
 }
 
-/**
- * Open a WebSocket connection to ElevenLabs streaming TTS.
- *
- * @param config  - voiceId and apiKey for the connection
- * @param onAudio - Called with base64-encoded PCM audio chunks
- * @param onDone  - Called when ElevenLabs signals generation is complete
- */
+export interface ElevenLabsContext {
+  sendText(text: string, flush?: boolean): void;
+  endStream(): void;
+  close(): void;
+}
+
+export interface PersistentElevenLabsWS {
+  createContext(
+    onAudio: (pcmBase64: string) => void,
+    onDone: () => void
+  ): ElevenLabsContext;
+  destroy(): void;
+  isConnected(): boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Voice settings (shared)
+// ---------------------------------------------------------------------------
+
+const VOICE_SETTINGS = {
+  stability: 0.70,
+  similarity_boost: 0.75,
+  use_speaker_boost: true,
+};
+
+const GENERATION_CONFIG = {
+  chunk_length_schedule: [50, 90, 120, 150],
+};
+
+// ---------------------------------------------------------------------------
+// Per-turn client (legacy, kept for fallback)
+// ---------------------------------------------------------------------------
+
 export function createElevenLabsWS(
   config: ElevenLabsConfig,
   onAudio: (pcmBase64: string) => void,
@@ -44,7 +69,6 @@ export function createElevenLabsWS(
   let closed = false;
   let eosQueued = false;
   let doneFired = false;
-  // Queue messages that arrive before the WS is open
   const pendingQueue: string[] = [];
 
   function fireDone() {
@@ -64,23 +88,14 @@ export function createElevenLabsWS(
 
   ws.addEventListener("open", () => {
     open = true;
-    // Send Beginning-of-Stream (BOS) message
     const bos = {
       text: " ",
-      voice_settings: {
-        stability: 0.70,
-        similarity_boost: 0.75,
-        use_speaker_boost: true,
-      },
-      generation_config: {
-        chunk_length_schedule: [50, 90, 120, 150],
-      },
+      voice_settings: VOICE_SETTINGS,
+      generation_config: GENERATION_CONFIG,
       xi_api_key: config.apiKey,
     };
     ws!.send(JSON.stringify(bos));
-    console.log("[ElevenLabs] WebSocket opened, BOS sent");
 
-    // Flush any messages that were queued while connecting
     for (const msg of pendingQueue) {
       ws!.send(msg);
     }
@@ -90,28 +105,20 @@ export function createElevenLabsWS(
   ws.addEventListener("message", (event: MessageEvent) => {
     try {
       const data = typeof event.data === "string" ? JSON.parse(event.data) : {};
-      if (data.audio) {
-        onAudio(data.audio);
-      }
-      if (data.isFinal) {
-        fireDone();
-      }
+      if (data.audio) onAudio(data.audio);
+      if (data.isFinal) fireDone();
     } catch (err) {
       console.error("[ElevenLabs] Failed to parse message:", err);
     }
   });
 
-  ws.addEventListener("error", (event: Event) => {
-    console.error("[ElevenLabs] WebSocket error:", event);
+  ws.addEventListener("error", () => {
     open = false;
     fireDone();
   });
 
   ws.addEventListener("close", () => {
     open = false;
-    console.log("[ElevenLabs] WebSocket closed");
-    // Resolve the done promise on close — critical for barge-in
-    // so the pipeline doesn't hang for 15 seconds
     fireDone();
   });
 
@@ -119,38 +126,181 @@ export function createElevenLabsWS(
     sendText(text: string, flush = false) {
       if (closed) return;
       const msg = JSON.stringify({ text, flush });
-      if (ws && open) {
-        ws.send(msg);
-      } else if (ws) {
-        // WS connecting but not open yet — queue for delivery
-        pendingQueue.push(msg);
-      }
+      if (ws && open) ws.send(msg);
+      else if (ws) pendingQueue.push(msg);
     },
-
     endStream() {
       if (closed || eosQueued) return;
       eosQueued = true;
       const msg = JSON.stringify({ text: "" });
-      if (ws && open) {
-        ws.send(msg);
-        console.log("[ElevenLabs] EOS sent");
-      } else if (ws) {
-        pendingQueue.push(msg);
-      }
+      if (ws && open) ws.send(msg);
+      else if (ws) pendingQueue.push(msg);
     },
-
     close() {
       closed = true;
       open = false;
       pendingQueue.length = 0;
+      if (ws) { try { ws.close(); } catch {} ws = null; }
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Persistent client (reuses one WS across turns)
+// ---------------------------------------------------------------------------
+
+/**
+ * Open a persistent WebSocket to ElevenLabs. Each turn creates a "context"
+ * by sending a fresh BOS, text chunks, and EOS on the same connection.
+ * Saves 150-300ms TCP+TLS handshake per turn.
+ */
+export function createPersistentElevenLabsWS(
+  config: ElevenLabsConfig
+): PersistentElevenLabsWS {
+  const url =
+    `wss://api.elevenlabs.io/v1/text-to-speech/${config.voiceId}/stream-input` +
+    `?model_id=eleven_flash_v2_5&output_format=pcm_16000`;
+
+  let ws: WebSocket | null = null;
+  let open = false;
+  let destroyed = false;
+
+  // Active context callbacks
+  let activeOnAudio: ((pcmBase64: string) => void) | null = null;
+  let activeOnDone: (() => void) | null = null;
+  let activeDoneFired = false;
+
+  function fireActiveDone() {
+    if (!activeDoneFired && activeOnDone) {
+      activeDoneFired = true;
+      activeOnDone();
+    }
+  }
+
+  try {
+    ws = new WebSocket(url);
+  } catch (err) {
+    console.error("[ElevenLabs] Failed to create persistent WebSocket:", err);
+    return {
+      createContext(onAudio, onDone) {
+        setTimeout(onDone, 0);
+        return { sendText() {}, endStream() {}, close() {} };
+      },
+      destroy() {},
+      isConnected() { return false; },
+    };
+  }
+
+  ws.addEventListener("open", () => {
+    open = true;
+    console.log("[ElevenLabs] Persistent WS opened");
+  });
+
+  ws.addEventListener("message", (event: MessageEvent) => {
+    try {
+      const data = typeof event.data === "string" ? JSON.parse(event.data) : {};
+      if (data.audio && activeOnAudio) {
+        activeOnAudio(data.audio);
+      }
+      if (data.isFinal) {
+        fireActiveDone();
+      }
+    } catch (err) {
+      console.error("[ElevenLabs] Failed to parse message:", err);
+    }
+  });
+
+  ws.addEventListener("error", () => {
+    open = false;
+    fireActiveDone();
+  });
+
+  ws.addEventListener("close", () => {
+    open = false;
+    console.log("[ElevenLabs] Persistent WS closed");
+    fireActiveDone();
+  });
+
+  return {
+    createContext(
+      onAudio: (pcmBase64: string) => void,
+      onDone: () => void
+    ): ElevenLabsContext {
+      // Set active context callbacks
+      activeOnAudio = onAudio;
+      activeOnDone = onDone;
+      activeDoneFired = false;
+
+      let contextClosed = false;
+      let eosQueued = false;
+      const pendingQueue: string[] = [];
+
+      // Send BOS for this turn
+      const bos = {
+        text: " ",
+        voice_settings: VOICE_SETTINGS,
+        generation_config: GENERATION_CONFIG,
+        xi_api_key: config.apiKey,
+      };
+
+      if (ws && open) {
+        ws.send(JSON.stringify(bos));
+      } else {
+        // WS not open yet — queue BOS and everything after it
+        pendingQueue.push(JSON.stringify(bos));
+        // Set up a one-time flush when WS opens
+        const flushOnOpen = () => {
+          if (ws && open && pendingQueue.length > 0) {
+            for (const msg of pendingQueue) {
+              ws.send(msg);
+            }
+            pendingQueue.length = 0;
+          }
+        };
+        ws?.addEventListener("open", flushOnOpen, { once: true });
+      }
+
+      return {
+        sendText(text: string, flush = false) {
+          if (contextClosed || destroyed) return;
+          const msg = JSON.stringify({ text, flush });
+          if (ws && open) ws.send(msg);
+          else pendingQueue.push(msg);
+        },
+        endStream() {
+          if (contextClosed || destroyed || eosQueued) return;
+          eosQueued = true;
+          const msg = JSON.stringify({ text: "" });
+          if (ws && open) ws.send(msg);
+          else pendingQueue.push(msg);
+        },
+        close() {
+          // Close just this context's stream, not the persistent connection
+          contextClosed = true;
+          if (!eosQueued && ws && open) {
+            ws.send(JSON.stringify({ text: "" }));
+          }
+          fireActiveDone();
+          activeOnAudio = null;
+          activeOnDone = null;
+        },
+      };
+    },
+
+    destroy() {
+      destroyed = true;
+      open = false;
+      activeOnAudio = null;
+      activeOnDone = null;
       if (ws) {
-        try {
-          ws.close();
-        } catch {
-          // ignore
-        }
+        try { ws.close(); } catch {}
         ws = null;
       }
+      console.log("[ElevenLabs] Persistent WS destroyed");
+    },
+
+    isConnected() {
+      return open;
     },
   };
 }

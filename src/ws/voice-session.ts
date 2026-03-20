@@ -1,7 +1,7 @@
 /**
  * VoiceSession — Per-connection state machine for streaming voice pipeline.
- * Manages Deepgram STT connection, audio forwarding, LLM-to-TTS pipeline,
- * and transcript delivery.
+ * Manages Deepgram STT, persistent ElevenLabs TTS, audio forwarding,
+ * LLM-to-TTS pipeline, and transcript delivery.
  */
 
 import { createDeepgramConnection, type DeepgramConnection } from "./deepgram-client";
@@ -11,6 +11,8 @@ import {
   type StreamLLMToTTSResult,
 } from "../pipeline/audio-pipeline";
 import { createVADProcessor, type VADProcessor } from "./vad-processor";
+import { createPersistentElevenLabsWS, type PersistentElevenLabsWS } from "./elevenlabs-client";
+import { extractLeadFromHistory } from "../pipeline/lead-extractor";
 import type OpenAI from "openai";
 
 // ---------------------------------------------------------------------------
@@ -55,16 +57,18 @@ export class VoiceSession {
   private config: VoiceSessionConfig;
   private vadProcessor: VADProcessor | null = null;
   private consecutiveSpeechFrames = 0;
-  private static readonly BARGE_IN_THRESHOLD = 3; // Require 3 consecutive speech frames
-  /** Active ElevenLabs WS handle — stored so barge-in can close it */
+  private static readonly BARGE_IN_THRESHOLD = 1; // VAD already requires 6 consecutive frames internally
+  /** Active ElevenLabs context close handle for barge-in */
   private activeElevenLabsClose: (() => void) | null = null;
+  /** Persistent ElevenLabs WS — reused across all turns in this session */
+  private persistentElevenLabs: PersistentElevenLabsWS | null = null;
   /** Timestamp of last speech_final / utterance_end from Deepgram */
   private speechEndTime = 0;
   /** Timestamp when first audio chunk sent to browser for current turn */
   private firstAudioSentTime = 0;
   /** Whether this is the greeting turn (no user input yet) */
   private isGreeting = false;
-  /** Guard: true while handleFinalTranscript is running (prevents concurrent calls) */
+  /** Guard: true while handleFinalTranscript is running */
   private pipelineRunning = false;
 
   constructor(
@@ -73,7 +77,6 @@ export class VoiceSession {
   ) {
     this.browserWs = browserWs;
     this.config = config;
-    // Initialize energy-based VAD (synchronous, no native deps)
     this.vadProcessor = createVADProcessor();
     console.log("[VoiceSession] VAD processor initialized (energy-based)");
   }
@@ -82,9 +85,6 @@ export class VoiceSession {
   // Public API
   // -------------------------------------------------------------------------
 
-  /**
-   * Handle JSON control messages from the browser.
-   */
   handleControl(data: ControlMessage): void {
     switch (data.type) {
       case "start":
@@ -98,20 +98,11 @@ export class VoiceSession {
     }
   }
 
-  /**
-   * Handle binary audio frames from the browser.
-   * During 'listening': forward to Deepgram for STT.
-   * During 'speaking': route to VAD for barge-in detection AND keep Deepgram fed.
-   */
   onAudioFrame(data: ArrayBuffer): void {
     if (this.state === "listening" && this.deepgram) {
       this.deepgram.send(data);
     } else if (this.state === "speaking") {
-      // Keep Deepgram fed so it's ready when barge-in triggers
-      if (this.deepgram) {
-        this.deepgram.send(data);
-      }
-      // Run VAD for barge-in detection
+      if (this.deepgram) this.deepgram.send(data);
       if (this.vadProcessor && this.state === "speaking") {
         const isSpeech = this.vadProcessor.processFrame(data);
         if (isSpeech) {
@@ -123,16 +114,11 @@ export class VoiceSession {
           this.consecutiveSpeechFrames = 0;
         }
       }
-    }
-    // During 'processing' state: still feed Deepgram so it stays ready
-    else if (this.state === "processing" && this.deepgram) {
+    } else if (this.state === "processing" && this.deepgram) {
       this.deepgram.send(data);
     }
   }
 
-  /**
-   * Clean up all resources for this session.
-   */
   cleanup(): void {
     this.stopKeepAlive();
 
@@ -146,6 +132,12 @@ export class VoiceSession {
       this.activeElevenLabsClose = null;
     }
 
+    // Destroy persistent ElevenLabs connection
+    if (this.persistentElevenLabs) {
+      this.persistentElevenLabs.destroy();
+      this.persistentElevenLabs = null;
+    }
+
     this.vadProcessor?.reset();
     this.consecutiveSpeechFrames = 0;
     this.pipelineRunning = false;
@@ -155,90 +147,50 @@ export class VoiceSession {
     console.log("[VoiceSession] Cleaned up");
   }
 
-  /**
-   * Handle barge-in: user spoke while agent was speaking.
-   * Stops TTS, clears browser playback, transitions to listening.
-   */
   private handleBargeIn(): void {
     if (this.state !== "speaking") return;
 
     console.log("[VoiceSession] Barge-in detected — interrupting agent");
 
-    // 1. Set state to interrupted (then quickly to listening)
     this.setState("interrupted");
 
-    // 2. Close active ElevenLabs connection to stop TTS generation
+    // Close the active ElevenLabs context (not the persistent connection)
     if (this.activeElevenLabsClose) {
       this.activeElevenLabsClose();
       this.activeElevenLabsClose = null;
     }
 
-    // 3. Tell browser to clear its playback queue
     this.sendToBrowser({ type: "stop_playback" });
 
-    // 4. Reset VAD state
     this.vadProcessor?.reset();
     this.consecutiveSpeechFrames = 0;
 
-    // 5. Transition to listening — Deepgram is already receiving audio
     this.setState("listening");
   }
 
-  /**
-   * Get current session state.
-   */
-  getState(): SessionState {
-    return this.state;
-  }
+  getState(): SessionState { return this.state; }
+  getHistory(): ConversationEntry[] { return this.conversationHistory; }
+  getIndustry(): string { return this.industry; }
 
-  /**
-   * Get conversation history.
-   */
-  getHistory(): ConversationEntry[] {
-    return this.conversationHistory;
-  }
-
-  /**
-   * Get industry for this session.
-   */
-  getIndustry(): string {
-    return this.industry;
-  }
-
-  /**
-   * Transition to speaking state (called when TTS starts playing).
-   * Starts a VAD cooldown to prevent Marie's own audio from triggering barge-in.
-   */
   setSpeaking(): void {
     this.setState("speaking");
-    // 800ms cooldown — ignore VAD while echo cancellation settles
     this.vadProcessor?.startCooldown(800);
     this.consecutiveSpeechFrames = 0;
   }
 
-  /**
-   * Transition back to listening after speaking completes.
-   */
   resumeListening(): void {
     if (this.state === "speaking" || this.state === "processing" || this.state === "interrupted") {
       this.setState("listening");
     }
   }
 
-  /**
-   * Add an entry to conversation history.
-   * For assistant entries, wrap in JSON so the LLM sees consistent format.
-   */
   addToHistory(role: "user" | "assistant", content: string): void {
     if (role === "assistant") {
-      // Store as JSON so the LLM sees the same format it's expected to output.
-      // Prevents the model from drifting to plain text after seeing non-JSON history.
       const jsonContent = JSON.stringify({ spoken: content, save_lead: false, end_call: false });
       this.conversationHistory.push({ role, content: jsonContent });
     } else {
       this.conversationHistory.push({ role, content });
     }
-    // Cap history at 20 entries (10 turns)
     if (this.conversationHistory.length > 20) {
       this.conversationHistory = this.conversationHistory.slice(-20);
     }
@@ -251,24 +203,26 @@ export class VoiceSession {
   private startListening(industry: string): void {
     this.industry = industry;
 
-    // Close existing Deepgram connection if any
     if (this.deepgram) {
       this.deepgram.close();
       this.deepgram = null;
     }
 
-    // Track whether we've already triggered for the current utterance
+    // Create persistent ElevenLabs connection for this session
+    if (this.persistentElevenLabs) this.persistentElevenLabs.destroy();
+    this.persistentElevenLabs = createPersistentElevenLabsWS({
+      voiceId: this.config.elevenLabsVoiceId,
+      apiKey: this.config.elevenLabsApiKey,
+    });
+
     let lastHandledTranscript = "";
 
     this.deepgram = createDeepgramConnection(
-      // onTranscript
       (text: string, isFinal: boolean) => {
         if (isFinal) {
-          // Record when user stopped speaking (for latency measurement)
           this.speechEndTime = Date.now();
         }
 
-        // Send transcript to browser for display (include speechEndTime for client-side latency)
         this.sendToBrowser({
           type: "transcript",
           text,
@@ -277,8 +231,6 @@ export class VoiceSession {
         });
 
         if (isFinal && text.trim()) {
-          // Guard: skip if we already handled this exact transcript
-          // (Deepgram can fire both is_final and speech_final for the same text)
           if (text.trim() === lastHandledTranscript) {
             console.log("[VoiceSession] Skipping duplicate final transcript");
             return;
@@ -286,29 +238,21 @@ export class VoiceSession {
           lastHandledTranscript = text.trim();
 
           this.addToHistory("user", text.trim());
-          // Trigger the LLM → TTS streaming pipeline
           this.handleFinalTranscript(text.trim());
         }
       },
-      // onError
       (error: Error) => {
         console.error("[VoiceSession] Deepgram error:", error.message);
-        this.sendToBrowser({
-          type: "error",
-          message: "Speech recognition error",
-        });
+        this.sendToBrowser({ type: "error", message: "Speech recognition error" });
       },
-      // onClose
       () => {
         console.log("[VoiceSession] Deepgram connection closed");
       }
     );
 
     this.startKeepAlive();
-
     console.log(`[VoiceSession] Started listening for industry: ${industry}`);
 
-    // Trigger greeting immediately
     this.playGreeting();
   }
 
@@ -316,10 +260,6 @@ export class VoiceSession {
   // Private: Greeting
   // -------------------------------------------------------------------------
 
-  /**
-   * Play an initial greeting through the streaming pipeline.
-   * Uses the same LLM→TTS flow so the greeting is streamed with low latency.
-   */
   private async playGreeting(): Promise<void> {
     this.isGreeting = true;
 
@@ -351,6 +291,7 @@ export class VoiceSession {
         llmModel: this.config.llmModel,
         voiceId: this.config.elevenLabsVoiceId,
         elevenLabsApiKey: this.config.elevenLabsApiKey,
+        persistentElevenLabs: this.persistentElevenLabs ?? undefined,
 
         onTTSReady: (closeFn: () => void) => {
           this.activeElevenLabsClose = closeFn;
@@ -371,7 +312,6 @@ export class VoiceSession {
         onDone: () => {},
       });
 
-      // After greeting, start listening
       this.isGreeting = false;
       this.activeElevenLabsClose = null;
       this.resumeListening();
@@ -386,24 +326,19 @@ export class VoiceSession {
   // Private: LLM → TTS Pipeline
   // -------------------------------------------------------------------------
 
-  /**
-   * Called when Deepgram returns a final transcript.
-   * Triggers the streaming pipeline: LLM → TokenBuffer → ElevenLabs → browser.
-   */
   private async handleFinalTranscript(userText: string): Promise<void> {
-    // Guard: prevent concurrent pipeline runs (double transcripts, barge-in re-entry)
     if (this.pipelineRunning) {
       console.log("[VoiceSession] Pipeline already running, skipping transcript:", userText);
       return;
     }
     this.pipelineRunning = true;
 
-    // Transition to processing
     this.setState("processing");
 
     const systemPrompt = this.config.buildPrompt(this.industry);
     let firstAudioReceived = false;
     this.firstAudioSentTime = 0;
+    let llmFirstTokenTime = 0;
 
     try {
       const result: StreamLLMToTTSResult = await streamLLMToTTS({
@@ -415,67 +350,66 @@ export class VoiceSession {
         llmModel: this.config.llmModel,
         voiceId: this.config.elevenLabsVoiceId,
         elevenLabsApiKey: this.config.elevenLabsApiKey,
+        persistentElevenLabs: this.persistentElevenLabs ?? undefined,
 
-        // onTTSReady: store close handle for barge-in
         onTTSReady: (closeFn: () => void) => {
           this.activeElevenLabsClose = closeFn;
         },
 
-        // onAudio: send binary PCM to browser, set speaking state on first chunk
+        onLLMFirstToken: () => {
+          llmFirstTokenTime = Date.now();
+          if (this.speechEndTime > 0) {
+            console.log(`[GloVoice] Deepgram->LLM first token: ${llmFirstTokenTime - this.speechEndTime}ms`);
+          }
+        },
+
         onAudio: (pcmBuffer: ArrayBuffer) => {
           if (!firstAudioReceived) {
             firstAudioReceived = true;
             this.firstAudioSentTime = Date.now();
             this.setSpeaking();
 
-            // Log server-side latency
             if (this.speechEndTime > 0) {
-              const latency = this.firstAudioSentTime - this.speechEndTime;
-              console.log(`[GloVoice] Server-side latency: ${latency}ms`);
+              const total = this.firstAudioSentTime - this.speechEndTime;
+              const llmToTTS = llmFirstTokenTime > 0 ? this.firstAudioSentTime - llmFirstTokenTime : 0;
+              console.log(`[GloVoice] LLM->TTS first audio: ${llmToTTS}ms`);
+              console.log(`[GloVoice] Total server-side latency: ${total}ms`);
             }
           }
           this.sendBinaryToBrowser(pcmBuffer);
         },
 
-        // onSpoken: add assistant response to conversation history
         onSpoken: (fullText: string) => {
           this.addToHistory("assistant", fullText);
         },
 
-        // onDone: all audio finished
-        onDone: () => {
-          // Handled after the await below
-        },
+        onDone: () => {},
       });
 
-      // Handle lead capture
+      // Handle lead capture — extract from conversation history
       if (result.save_lead) {
-        // Merge any lead data from the LLM response
-        if (result.lead.name) this.lead.name = result.lead.name;
-        if (result.lead.phone) this.lead.phone = result.lead.phone;
-        if (result.lead.email) this.lead.email = result.lead.email;
+        const extracted = extractLeadFromHistory(this.conversationHistory);
+        if (extracted.name) this.lead.name = extracted.name;
+        if (extracted.phone) this.lead.phone = extracted.phone;
+        if (extracted.email) this.lead.email = extracted.email;
 
-        // Notify server for Supabase save + email + Telegram
+        console.log(`[VoiceSession] Lead extracted: name="${this.lead.name}" phone="${this.lead.phone}" email="${this.lead.email}"`);
+
         this.config.onLeadCaptured?.(this.lead, this.industry);
       }
 
-      // Handle end call
       if (result.end_call) {
         this.pipelineRunning = false;
         this.sendToBrowser({ type: "end_call" });
-        return; // Don't resume listening
+        return;
       }
 
-      // Resume listening for next user utterance
       this.activeElevenLabsClose = null;
       this.pipelineRunning = false;
       this.resumeListening();
     } catch (err) {
       console.error("[VoiceSession] Pipeline error:", err);
-      this.sendToBrowser({
-        type: "error",
-        message: "Processing error",
-      });
+      this.sendToBrowser({ type: "error", message: "Processing error" });
       this.activeElevenLabsClose = null;
       this.pipelineRunning = false;
       this.resumeListening();
@@ -489,35 +423,21 @@ export class VoiceSession {
   private setState(newState: SessionState): void {
     const oldState = this.state;
     this.state = newState;
-
     if (oldState !== newState) {
-      this.sendToBrowser({
-        type: "status",
-        state: newState,
-      });
+      this.sendToBrowser({ type: "status", state: newState });
     }
   }
 
   private sendToBrowser(data: Record<string, unknown>): void {
-    try {
-      this.browserWs.send(JSON.stringify(data));
-    } catch (err) {
-      console.error("[VoiceSession] Failed to send to browser:", err);
-    }
+    try { this.browserWs.send(JSON.stringify(data)); }
+    catch (err) { console.error("[VoiceSession] Failed to send to browser:", err); }
   }
 
   private sendBinaryToBrowser(buffer: ArrayBuffer): void {
-    try {
-      this.browserWs.send(buffer);
-    } catch (err) {
-      console.error("[VoiceSession] Failed to send binary to browser:", err);
-    }
+    try { this.browserWs.send(buffer); }
+    catch (err) { console.error("[VoiceSession] Failed to send binary to browser:", err); }
   }
 
-  /**
-   * Keep Deepgram connection alive during non-audio states (processing, speaking).
-   * Sends keepalive every 5 seconds when not actively forwarding audio.
-   */
   private startKeepAlive(): void {
     this.stopKeepAlive();
     this.keepAliveInterval = setInterval(() => {

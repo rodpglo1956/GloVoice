@@ -3,12 +3,13 @@
  *   transcript → LLM stream → TokenBuffer → ElevenLabs WS → browser audio
  *
  * Accepts all config as parameters (no shared module extraction).
+ * Supports both per-turn and persistent ElevenLabs connections.
  */
 
 import type OpenAI from "openai";
 import { TokenBuffer } from "./token-buffer";
 import { SpokenExtractor } from "./spoken-extractor";
-import { createElevenLabsWS } from "../ws/elevenlabs-client";
+import { createElevenLabsWS, type PersistentElevenLabsWS, type ElevenLabsContext } from "../ws/elevenlabs-client";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -29,14 +30,14 @@ export interface StreamLLMToTTSParams {
   llmModel: string;
   voiceId: string;
   elevenLabsApiKey: string;
-  /** Called with decoded PCM audio buffer for each ElevenLabs chunk */
   onAudio: (pcmBuffer: ArrayBuffer) => void;
-  /** Called with the full spoken text after LLM stream completes */
   onSpoken: (fullText: string) => void;
-  /** Called when all audio generation is complete */
   onDone: () => void;
-  /** Called with the ElevenLabs close function so caller can abort TTS on barge-in */
   onTTSReady?: (closeFn: () => void) => void;
+  /** Optional: called when first LLM token arrives (for stage latency logging) */
+  onLLMFirstToken?: () => void;
+  /** Optional: persistent ElevenLabs connection (reuses TCP+TLS across turns) */
+  persistentElevenLabs?: PersistentElevenLabsWS;
 }
 
 export interface StreamLLMToTTSResult {
@@ -46,7 +47,7 @@ export interface StreamLLMToTTSResult {
 }
 
 // ---------------------------------------------------------------------------
-// Parse assistant JSON (same logic as server.ts parseAssistantResponse)
+// Parse assistant JSON
 // ---------------------------------------------------------------------------
 
 interface ParsedResponse {
@@ -127,12 +128,6 @@ function buildLeadContext(lead: LeadState): string {
 // Main pipeline
 // ---------------------------------------------------------------------------
 
-/**
- * Stream LLM response through TokenBuffer into ElevenLabs WebSocket TTS.
- * Audio chunks are delivered to the browser as they arrive from ElevenLabs.
- *
- * Returns flags (save_lead, end_call, lead) for the caller to act on.
- */
 export async function streamLLMToTTS(
   params: StreamLLMToTTSParams
 ): Promise<StreamLLMToTTSResult> {
@@ -149,55 +144,62 @@ export async function streamLLMToTTS(
     onSpoken,
     onDone,
     onTTSReady,
+    onLLMFirstToken,
+    persistentElevenLabs,
   } = params;
 
-  // Track the full accumulated LLM response for parsing after stream ends
   let fullResponse = "";
 
-  // --- ElevenLabs WS ---
-  // We need a Promise that resolves when ElevenLabs signals it's done
+  // --- ElevenLabs (persistent or per-turn) ---
   let resolveElDone: () => void;
   const elDonePromise = new Promise<void>((resolve) => {
     resolveElDone = resolve;
   });
 
-  const elevenlabs = createElevenLabsWS(
-    { voiceId, apiKey: elevenLabsApiKey },
-    // onAudio: decode base64 PCM → ArrayBuffer → send to browser
-    (pcmBase64: string) => {
-      try {
-        const buffer = base64ToArrayBuffer(pcmBase64);
-        onAudio(buffer);
-      } catch (err) {
-        console.error("[AudioPipeline] Failed to decode audio chunk:", err);
-      }
-    },
-    // onDone: ElevenLabs finished generating all audio
-    () => {
-      resolveElDone();
+  const onAudioCallback = (pcmBase64: string) => {
+    try {
+      const buffer = base64ToArrayBuffer(pcmBase64);
+      onAudio(buffer);
+    } catch (err) {
+      console.error("[AudioPipeline] Failed to decode audio chunk:", err);
     }
-  );
+  };
+
+  const onDoneCallback = () => {
+    resolveElDone();
+  };
+
+  // Use persistent connection if available, otherwise fall back to per-turn
+  let elevenlabs: { sendText: (t: string, f?: boolean) => void; endStream: () => void; close: () => void };
+  let isPersistent = false;
+
+  if (persistentElevenLabs && persistentElevenLabs.isConnected()) {
+    const ctx = persistentElevenLabs.createContext(onAudioCallback, onDoneCallback);
+    elevenlabs = ctx;
+    isPersistent = true;
+  } else {
+    elevenlabs = createElevenLabsWS(
+      { voiceId, apiKey: elevenLabsApiKey },
+      onAudioCallback,
+      onDoneCallback
+    );
+  }
 
   // Expose close handle for barge-in abort
   onTTSReady?.(() => elevenlabs.close());
 
   // --- Token Buffer ---
   const tokenBuffer = new TokenBuffer((chunk: string) => {
-    // Each flushed sentence gets sent to ElevenLabs with flush=true
     elevenlabs.sendText(chunk, true);
   });
 
   // --- Spoken Extractor ---
-  // LLM outputs JSON: {"spoken":"...","save_lead":false,...}
-  // We only want to send the "spoken" value to TTS, not the JSON syntax.
   const spokenExtractor = new SpokenExtractor((text: string) => {
     tokenBuffer.add(text);
   });
 
   // --- LLM Streaming ---
   const fullSystemPrompt = systemPrompt + buildLeadContext(lead);
-
-  // Cap history at last 10 messages (5 turns)
   const recentHistory = history.slice(-10);
   const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
     { role: "system", content: fullSystemPrompt },
@@ -207,6 +209,8 @@ export async function streamLLMToTTS(
     })),
     { role: "user", content: userText.trim() },
   ];
+
+  let firstTokenFired = false;
 
   try {
     const stream = await openaiClient.chat.completions.create({
@@ -221,13 +225,16 @@ export async function streamLLMToTTS(
     for await (const chunk of stream) {
       const token = chunk.choices[0]?.delta?.content;
       if (token) {
+        if (!firstTokenFired) {
+          firstTokenFired = true;
+          onLLMFirstToken?.();
+        }
         fullResponse += token;
         spokenExtractor.add(token);
       }
     }
   } catch (err) {
     console.error("[AudioPipeline] LLM stream error:", err);
-    // On LLM error, flush a fallback message through TTS
     const fallbackText = "I'm sorry, could you say that again?";
     elevenlabs.sendText(fallbackText, true);
     fullResponse = JSON.stringify({
@@ -237,33 +244,26 @@ export async function streamLLMToTTS(
     });
   }
 
-  // Flush any remaining tokens after LLM stream completes
   tokenBuffer.forceFlush();
 
-  // Parse the full accumulated response for flags
   const parsed = parseStreamedResponse(fullResponse);
 
-  // Fallback: if SpokenExtractor never found "spoken" in the stream
-  // (LLM returned plain text, or JSON was malformed), send parsed spoken text directly
   if (!spokenExtractor.hasForwarded() && parsed.spoken) {
     console.log("[AudioPipeline] SpokenExtractor missed — sending parsed fallback to TTS");
     elevenlabs.sendText(parsed.spoken, true);
   }
 
-  // Signal end of text input to ElevenLabs
   elevenlabs.endStream();
-
-  // Notify caller of the full spoken text
   onSpoken(parsed.spoken);
 
-  // Wait for ElevenLabs to finish generating audio, with a timeout
   const timeout = new Promise<void>((resolve) => setTimeout(resolve, 15000));
   await Promise.race([elDonePromise, timeout]);
 
-  // Clean up ElevenLabs connection
-  elevenlabs.close();
+  // For per-turn connections, close the WS. For persistent, don't destroy the connection.
+  if (!isPersistent) {
+    elevenlabs.close();
+  }
 
-  // Notify caller that all audio is done
   onDone();
 
   return {
