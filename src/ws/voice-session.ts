@@ -11,7 +11,6 @@ import {
   type StreamLLMToTTSResult,
 } from "../pipeline/audio-pipeline";
 import { createVADProcessor, type VADProcessor } from "./vad-processor";
-import { createPersistentElevenLabsWS, type PersistentElevenLabsWS } from "./elevenlabs-client";
 import { extractLeadFromHistory } from "../pipeline/lead-extractor";
 import type OpenAI from "openai";
 
@@ -60,8 +59,6 @@ export class VoiceSession {
   private static readonly BARGE_IN_THRESHOLD = 1; // VAD already requires 6 consecutive frames internally
   /** Active ElevenLabs context close handle for barge-in */
   private activeElevenLabsClose: (() => void) | null = null;
-  /** Persistent ElevenLabs WS — reused across all turns in this session */
-  private persistentElevenLabs: PersistentElevenLabsWS | null = null;
   /** Timestamp of last speech_final / utterance_end from Deepgram */
   private speechEndTime = 0;
   /** Timestamp when first audio chunk sent to browser for current turn */
@@ -130,12 +127,6 @@ export class VoiceSession {
     if (this.activeElevenLabsClose) {
       this.activeElevenLabsClose();
       this.activeElevenLabsClose = null;
-    }
-
-    // Destroy persistent ElevenLabs connection
-    if (this.persistentElevenLabs) {
-      this.persistentElevenLabs.destroy();
-      this.persistentElevenLabs = null;
     }
 
     this.vadProcessor?.reset();
@@ -207,13 +198,6 @@ export class VoiceSession {
       this.deepgram.close();
       this.deepgram = null;
     }
-
-    // Create persistent ElevenLabs connection for this session
-    if (this.persistentElevenLabs) this.persistentElevenLabs.destroy();
-    this.persistentElevenLabs = createPersistentElevenLabsWS({
-      voiceId: this.config.elevenLabsVoiceId,
-      apiKey: this.config.elevenLabsApiKey,
-    });
 
     let lastHandledTranscript = "";
 
@@ -291,7 +275,6 @@ export class VoiceSession {
         llmModel: this.config.llmModel,
         voiceId: this.config.elevenLabsVoiceId,
         elevenLabsApiKey: this.config.elevenLabsApiKey,
-        persistentElevenLabs: this.persistentElevenLabs ?? undefined,
 
         onTTSReady: (closeFn: () => void) => {
           this.activeElevenLabsClose = closeFn;
@@ -350,7 +333,6 @@ export class VoiceSession {
         llmModel: this.config.llmModel,
         voiceId: this.config.elevenLabsVoiceId,
         elevenLabsApiKey: this.config.elevenLabsApiKey,
-        persistentElevenLabs: this.persistentElevenLabs ?? undefined,
 
         onTTSReady: (closeFn: () => void) => {
           this.activeElevenLabsClose = closeFn;
