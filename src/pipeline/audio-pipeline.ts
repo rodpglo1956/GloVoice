@@ -3,13 +3,13 @@
  *   transcript -> LLM stream -> TokenBuffer -> ElevenLabs WS -> browser audio
  *
  * Accepts all config as parameters (no shared module extraction).
- * Supports both per-turn and persistent ElevenLabs connections.
+ * Per-turn ElevenLabs WS (one BOS/EOS per connection).
  */
 
 import type OpenAI from "openai";
 import { TokenBuffer } from "./token-buffer";
 import { SpokenExtractor } from "./spoken-extractor";
-import { createElevenLabsWS, type PersistentElevenLabsWS } from "../ws/elevenlabs-client";
+import { createElevenLabsWS } from "../ws/elevenlabs-client";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -36,8 +36,6 @@ export interface StreamLLMToTTSParams {
   onTTSReady?: (closeFn: () => void) => void;
   /** Optional: called when first LLM token arrives (for stage latency logging) */
   onLLMFirstToken?: () => void;
-  /** Optional: persistent ElevenLabs connection (reuses TCP+TLS across turns) */
-  persistentElevenLabs?: PersistentElevenLabsWS;
 }
 
 export interface StreamLLMToTTSResult {
@@ -145,7 +143,6 @@ export async function streamLLMToTTS(
     onDone,
     onTTSReady,
     onLLMFirstToken,
-    persistentElevenLabs,
   } = params;
 
   let fullResponse = "";
@@ -169,22 +166,12 @@ export async function streamLLMToTTS(
     resolveElDone();
   };
 
-  // Use persistent connection if available, otherwise fall back to per-turn
-  let elevenlabs: { sendText: (t: string, f?: boolean) => void; endStream: () => void; close: () => void };
-
-  if (persistentElevenLabs && persistentElevenLabs.isConnected()) {
-    elevenlabs = persistentElevenLabs.createContext(onAudioCallback, onDoneCallback);
-    console.log("[AudioPipeline] Using persistent ElevenLabs connection");
-  } else {
-    elevenlabs = createElevenLabsWS(
-      { voiceId, apiKey: elevenLabsApiKey },
-      onAudioCallback,
-      onDoneCallback,
-    );
-    if (persistentElevenLabs) {
-      console.log("[AudioPipeline] Persistent WS not connected, falling back to per-turn");
-    }
-  }
+  // New per-turn ElevenLabs WS (stream-input is one BOS/EOS per connection)
+  const elevenlabs = createElevenLabsWS(
+    { voiceId, apiKey: elevenLabsApiKey },
+    onAudioCallback,
+    onDoneCallback,
+  );
 
   // Expose close handle for barge-in abort
   onTTSReady?.(() => elevenlabs.close());
@@ -260,7 +247,6 @@ export async function streamLLMToTTS(
   const timeout = new Promise<void>((resolve) => setTimeout(resolve, 15000));
   await Promise.race([elDonePromise, timeout]);
 
-  // For persistent connections, close() ends just the context; for per-turn, it closes the WS
   elevenlabs.close();
 
   onDone();

@@ -1,6 +1,6 @@
 /**
  * VoiceSession -- Per-connection state machine for streaming voice pipeline.
- * Manages Deepgram STT, persistent ElevenLabs TTS, audio forwarding,
+ * Manages Deepgram STT, per-turn ElevenLabs TTS, audio forwarding,
  * LLM-to-TTS pipeline, and transcript delivery.
  */
 
@@ -10,7 +10,6 @@ import {
   type LeadState,
   type StreamLLMToTTSResult,
 } from "../pipeline/audio-pipeline";
-import { createPersistentElevenLabsWS, type PersistentElevenLabsWS } from "./elevenlabs-client";
 import { createVADProcessor, type VADProcessor } from "./vad-processor";
 import { extractLeadFromHistory } from "../pipeline/lead-extractor";
 import type OpenAI from "openai";
@@ -68,10 +67,6 @@ export class VoiceSession {
   private isGreeting = false;
   /** Guard: true while handleFinalTranscript is running */
   private pipelineRunning = false;
-  /** Persistent ElevenLabs WS -- opened once per session, reused across turns */
-  private persistentElevenLabs: PersistentElevenLabsWS | null = null;
-  /** Turn counter for generating unique context IDs */
-  private turnCounter = 0;
 
   constructor(
     browserWs: { send(data: string | ArrayBuffer): number },
@@ -135,11 +130,6 @@ export class VoiceSession {
       this.activeElevenLabsClose = null;
     }
 
-    if (this.persistentElevenLabs) {
-      this.persistentElevenLabs.destroy();
-      this.persistentElevenLabs = null;
-    }
-
     this.vadProcessor?.reset();
     this.consecutiveSpeechFrames = 0;
     this.pipelineRunning = false;
@@ -156,7 +146,7 @@ export class VoiceSession {
 
     this.setState("interrupted");
 
-    // Close the active ElevenLabs context (not the persistent connection)
+    // Close the active ElevenLabs WS to stop TTS generation
     if (this.activeElevenLabsClose) {
       this.activeElevenLabsClose();
       this.activeElevenLabsClose = null;
@@ -245,16 +235,6 @@ export class VoiceSession {
       }
     );
 
-    // Create persistent ElevenLabs WS (reused across all turns in this session)
-    if (this.persistentElevenLabs) {
-      this.persistentElevenLabs.destroy();
-    }
-    this.persistentElevenLabs = createPersistentElevenLabsWS({
-      voiceId: this.config.elevenLabsVoiceId,
-      apiKey: this.config.elevenLabsApiKey,
-    });
-    this.turnCounter = 0;
-
     this.startKeepAlive();
     console.log(`[VoiceSession] Started listening for industry: ${industry}`);
 
@@ -296,7 +276,6 @@ export class VoiceSession {
         llmModel: this.config.llmModel,
         voiceId: this.config.elevenLabsVoiceId,
         elevenLabsApiKey: this.config.elevenLabsApiKey,
-        persistentElevenLabs: this.persistentElevenLabs ?? undefined,
 
         onTTSReady: (closeFn: () => void) => {
           this.activeElevenLabsClose = closeFn;
@@ -355,7 +334,6 @@ export class VoiceSession {
         llmModel: this.config.llmModel,
         voiceId: this.config.elevenLabsVoiceId,
         elevenLabsApiKey: this.config.elevenLabsApiKey,
-        persistentElevenLabs: this.persistentElevenLabs ?? undefined,
 
         onTTSReady: (closeFn: () => void) => {
           this.activeElevenLabsClose = closeFn;
